@@ -6,6 +6,6 @@ Since this project made significant changes to the source code, I haven't given 
 
 Since I downloaded the source code quite a while ago, I'm not too familiar with the features that are currently available, so refer to the original author's website for the most accurate information.
 
-Currently, I've added the following features on top of fixing the existing bugs.
-## Notes can be linked in a parent-child folder relationship
-## Added support library for Markdown rendering
+## Currently, I've added the following features on top of fixing the existing bugs.
+Notes can be linked in a parent-child folder relationship
+Added support library for Markdown rendering
