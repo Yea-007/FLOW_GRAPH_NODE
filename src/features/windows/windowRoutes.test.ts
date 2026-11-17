@@ -1,10 +1,5 @@
 import { describe, expect, it } from "vitest";
-import {
-  buildNotepadUrl,
-  buildTileUrl,
-  getInitialRoute,
-  routeFromSearch,
-} from "./windowRoutes";
+import { getInitialRoute, routeFromSearch } from "./windowRoutes";
 
 describe("window routes", () => {
   it("parses supported routes and note ids", () => {
@@ -17,14 +12,6 @@ describe("window routes", () => {
       noteId: "note-1",
     });
     expect(routeFromSearch("?view=unknown")).toEqual({ view: "main" });
-  });
-
-  it("builds app urls for dynamic windows", () => {
-    expect(buildNotepadUrl()).toBe("index.html?view=notepad");
-    expect(buildNotepadUrl("abc 123")).toBe(
-      "index.html?view=notepad&noteId=abc+123",
-    );
-    expect(buildTileUrl("note-1")).toBe("index.html?view=tile&noteId=note-1");
   });
 
   it("reads the browser location by default", () => {

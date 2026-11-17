@@ -64,18 +64,6 @@ export function buildNoteTree(notes: NoteMetadata[]): NoteTreeNode[] {
   return roots;
 }
 
-export function flattenTree(nodes: NoteTreeNode[]): NoteTreeNode[] {
-  const result: NoteTreeNode[] = [];
-  const walk = (list: NoteTreeNode[]) => {
-    for (const node of list) {
-      result.push(node);
-      walk(node.children);
-    }
-  };
-  walk(nodes);
-  return result;
-}
-
 export function filterNotes(notes: NoteMetadata[], query: string): NoteMetadata[] {
   const normalized = query.trim().toLowerCase();
   if (!normalized) return notes;
