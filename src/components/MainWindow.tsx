@@ -1,0 +1,1371 @@
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import type { MouseEvent } from "react";
+import { emit } from "@tauri-apps/api/event";
+import { exportMarkdownNote, importMarkdownNote } from "../features/importExport/api";
+import { MarkdownPreview } from "../features/markdown/MarkdownPreview";
+import { migrateLegacyStyles, type EditorDocument } from "../features/markdown/documentModel";
+import { findTextEdit, rebaseStyles, setRangeStyle, type StyleRange } from "../features/markdown/styleRanges";
+import { ContentHistory } from "../features/markdown/contentHistory";
+import {
+  chooseNotesDirectory,
+  getConfig,
+  normalizeViewMode,
+  saveConfig,
+} from "../features/settings/api";
+import type { AppConfig, ViewMode } from "../features/settings/types";
+import { normalizeTileColor } from "../features/settings/tileColor";
+import { SettingsPanel } from "./SettingsPanel";
+import { SlidingButtonGroup } from "./SlidingButtonGroup";
+import {
+  createNote,
+  deleteNote,
+  getErrorMessage,
+  getNote,
+  listNotes,
+  moveNote,
+  updateNote,
+  saveNoteStyles,
+} from "../features/notes/api";
+import type { Note, NoteMetadata } from "../features/notes/types";
+import {
+  buildNoteTree,
+  countNoteChars,
+  filterNotes,
+  formatShortDate,
+  formatTime,
+  metadataFromNote,
+} from "../features/notes/noteUtils";
+import {
+  noteContextMenuItems,
+  type NoteContextMenuAction,
+} from "../features/notes/noteContextMenu";
+import { NoteTree } from "../features/notes/NoteTree";
+import { ResizeHandle } from "./ResizeHandle";
+import { openNotepadWindow, openTileWindow } from "../features/windows/api";
+import {
+  closeCurrentWindow,
+  minimizeCurrentWindow,
+  toggleMaximizeCurrentWindow,
+  isCurrentWindowMaximized,
+  startCurrentWindowDrag,
+} from "../features/windows/controls";
+
+type SaveState = "idle" | "dirty" | "saving" | "saved" | "error";
+
+interface NoteMenuState {
+  x: number;
+  y: number;
+  noteId: string;
+}
+
+const saveStateLabel: Record<SaveState, string> = {
+  idle: "未选择",
+  dirty: "未保存",
+  saving: "保存中",
+  saved: "已保存",
+  error: "保存失败",
+};
+
+const MIN_SIDEBAR_WIDTH = 180;
+const MIN_EDITOR_WIDTH = 200;
+const MIN_PREVIEW_WIDTH = 200;
+const DEFAULT_SIDEBAR_WIDTH = 280;
+
+type FormatAction = "bold" | "italic" | "heading" | "hr" | "ul" | "ol" | "code" | "quote" | "strike" | "task" | "link" | "image" | "codeblock";
+
+const toolbarButtons: { label: string; title: string; style: string; action: FormatAction }[] = [
+  { label: "B", title: "粗体", style: "font-bold", action: "bold" },
+  { label: "I", title: "斜体", style: "italic", action: "italic" },
+  { label: "S", title: "删除线", style: "line-through", action: "strike" },
+  { label: "H", title: "标题", style: "font-bold", action: "heading" },
+  { label: "—", title: "分割线", style: "", action: "hr" },
+  { label: "•", title: "无序列表", style: "", action: "ul" },
+  { label: "1.", title: "有序列表", style: "font-mono text-[9px]", action: "ol" },
+  { label: "<>", title: "代码", style: "font-mono text-[9px]", action: "code" },
+  { label: "❝", title: "引用", style: "", action: "quote" },
+  { label: "☑", title: "任务列表", style: "", action: "task" },
+  { label: "🔗", title: "链接", style: "", action: "link" },
+  { label: "▧", title: "图片", style: "", action: "image" },
+  { label: "{ }", title: "代码块", style: "", action: "codeblock" },
+];
+
+function applyFormat(
+  textarea: HTMLTextAreaElement,
+  action: FormatAction,
+  setContent: (v: string) => void,
+  markDirty: () => void,
+) {
+  const { selectionStart: start, selectionEnd: end, value } = textarea;
+  const selected = value.slice(start, end);
+  const before = value.slice(0, start);
+  const after = value.slice(end);
+
+  const lineStart = before.lastIndexOf("\n") + 1;
+  const currentLine = before.slice(lineStart);
+
+  let result: string;
+  let cursorStart: number;
+  let cursorEnd: number;
+
+  switch (action) {
+    case "strike":
+    case "link":
+    case "image":
+    case "codeblock":
+    case "task": {
+      const text = selected || (action === "link" ? "链接文字" : action === "image" ? "图片描述" : action === "task" ? "任务" : action === "codeblock" ? "代码" : "文本");
+      const prefix = action === "strike" ? "~~" : action === "link" ? "[" : action === "image" ? "![" : action === "task" ? "- [ ] " : "```\n";
+      const suffix = action === "strike" ? "~~" : action === "link" || action === "image" ? "](https://)" : action === "codeblock" ? "\n```" : "";
+      result = before + prefix + text + suffix + after;
+      cursorStart = start + prefix.length;
+      cursorEnd = cursorStart + text.length;
+      break;
+    }
+    case "bold": {
+      const wrapped = `**${selected || "粗体文本"}**`;
+      result = before + wrapped + after;
+      cursorStart = start + 2;
+      cursorEnd = cursorStart + (selected || "粗体文本").length;
+      break;
+    }
+    case "italic": {
+      const wrapped = `*${selected || "斜体文本"}*`;
+      result = before + wrapped + after;
+      cursorStart = start + 1;
+      cursorEnd = cursorStart + (selected || "斜体文本").length;
+      break;
+    }
+    case "heading": {
+      const prefix = currentLine.match(/^(#{1,5})\s/);
+      if (prefix) {
+        const newLevel = prefix[1].length < 5 ? "#".repeat(prefix[1].length + 1) : "#";
+        const beforeLine = value.slice(0, lineStart);
+        const afterPrefix = value.slice(lineStart + prefix[0].length);
+        result = beforeLine + newLevel + " " + afterPrefix;
+        const offset = newLevel.length + 1 - prefix[0].length;
+        cursorStart = start + offset;
+        cursorEnd = end + offset;
+      } else if (currentLine.length > 0 && start === end) {
+        result = value.slice(0, lineStart) + "## " + value.slice(lineStart);
+        cursorStart = start + 3;
+        cursorEnd = cursorStart;
+      } else if (selected) {
+        result = before + `## ${selected}` + after;
+        cursorStart = start + 3;
+        cursorEnd = cursorStart + selected.length;
+      } else {
+        result = before + "## 标题" + after;
+        cursorStart = start + 3;
+        cursorEnd = cursorStart + 2;
+      }
+      break;
+    }
+    case "hr": {
+      const newlineBefore = before.endsWith("\n") || before === "" ? "" : "\n";
+      const newlineAfter = after.startsWith("\n") || after === "" ? "" : "\n";
+      result = before + `${newlineBefore}---${newlineAfter}` + after;
+      cursorStart = cursorEnd = before.length + newlineBefore.length + 3;
+      break;
+    }
+    case "ul": {
+      if (selected.includes("\n")) {
+        const lines = selected.split("\n").map((l) => `- ${l}`).join("\n");
+        result = before + lines + after;
+        cursorStart = start;
+        cursorEnd = start + lines.length;
+      } else {
+        const item = `- ${selected || "列表项"}`;
+        result = before + item + after;
+        cursorStart = start + 2;
+        cursorEnd = cursorStart + (selected || "列表项").length;
+      }
+      break;
+    }
+    case "ol": {
+      if (selected.includes("\n")) {
+        const lines = selected.split("\n").map((l, i) => `${i + 1}. ${l}`).join("\n");
+        result = before + lines + after;
+        cursorStart = start;
+        cursorEnd = start + lines.length;
+      } else {
+        const item = `1. ${selected || "列表项"}`;
+        result = before + item + after;
+        cursorStart = start + 3;
+        cursorEnd = cursorStart + (selected || "列表项").length;
+      }
+      break;
+    }
+    case "code": {
+      if (selected.includes("\n")) {
+        const wrapped = "```\n" + selected + "\n```";
+        result = before + wrapped + after;
+        cursorStart = start + 4;
+        cursorEnd = cursorStart + selected.length;
+      } else {
+        const wrapped = `\`${selected || "代码"}\``;
+        result = before + wrapped + after;
+        cursorStart = start + 1;
+        cursorEnd = cursorStart + (selected || "代码").length;
+      }
+      break;
+    }
+    case "quote": {
+      if (selected.includes("\n")) {
+        const lines = selected.split("\n").map((l) => `> ${l}`).join("\n");
+        result = before + lines + after;
+        cursorStart = start;
+        cursorEnd = start + lines.length;
+      } else {
+        const item = `> ${selected || "引用文本"}`;
+        result = before + item + after;
+        cursorStart = start + 2;
+        cursorEnd = cursorStart + (selected || "引用文本").length;
+      }
+      break;
+    }
+  }
+
+  setContent(result);
+  markDirty();
+  requestAnimationFrame(() => {
+    textarea.focus();
+    textarea.setSelectionRange(cursorStart, cursorEnd);
+  });
+}
+
+
+function applyHeading(textarea: HTMLTextAreaElement, level: string, setContent: (v: string) => void, markDirty: () => void) {
+  const { value, selectionStart, selectionEnd } = textarea;
+  const start = value.lastIndexOf("\n", selectionStart - 1) + 1;
+  const oldPrefix = value.slice(start).match(/^#{1,6}\s+/)?.[0] ?? "";
+  const prefix = level === "0" ? "" : "#".repeat(Number(level)) + " ";
+  setContent(value.slice(0, start) + prefix + value.slice(start + oldPrefix.length));
+  markDirty();
+  const shift = prefix.length - oldPrefix.length;
+  requestAnimationFrame(() => { textarea.focus(); textarea.setSelectionRange(Math.max(start + prefix.length, selectionStart + shift), Math.max(start + prefix.length, selectionEnd + shift)); });
+}
+
+interface MainWindowProps {
+  initialSettingsOpen?: boolean;
+  initialConfig?: AppConfig;
+}
+
+export function MainWindow({
+  initialSettingsOpen = false,
+  initialConfig = undefined,
+}: MainWindowProps = {}) {
+  const [notes, setNotes] = useState<NoteMetadata[]>([]);
+  const [selectedId, setSelectedId] = useState<string | null>(null);
+  const [searchQuery, setSearchQuery] = useState("");
+  const [viewMode, setViewMode] = useState<ViewMode>(
+    normalizeViewMode(initialConfig?.defaultViewMode ?? "split"),
+  );
+  const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
+  const [content, setContent] = useState("");
+  const [title, setTitle] = useState("");
+  const [saveState, setSaveState] = useState<SaveState>("idle");
+  const [hoveredId, setHoveredId] = useState<string | null>(null);
+  const [isLoading, setIsLoading] = useState(true);
+  const [errorMessage, setErrorMessage] = useState<string | null>(null);
+  const [noteMenu, setNoteMenu] = useState<NoteMenuState | null>(null);
+  const [noteMenuClosing, setNoteMenuClosing] = useState(false);
+  const [settingsOpen, setSettingsOpen] = useState(initialSettingsOpen);
+  const [settingsConfig, setSettingsConfig] = useState<AppConfig | null>(
+    initialConfig ?? null,
+  );
+  const [savedNotesDir, setSavedNotesDir] = useState<string | null>(
+    initialConfig?.notesDir ?? null,
+  );
+  const [noteTransitionKey, setNoteTransitionKey] = useState(0);
+  const [deleteConfirm, setDeleteConfirm] = useState(false);
+  const [deleteExiting, setDeleteExiting] = useState(false);
+  const [sidebarWidth, setSidebarWidth] = useState(DEFAULT_SIDEBAR_WIDTH);
+  const [splitRatio, setSplitRatio] = useState(0.5);
+  const contentRef = useRef<HTMLTextAreaElement>(null);
+  const [ranges, setRanges] = useState<StyleRange[]>([]);
+  const documentRef = useRef<EditorDocument>({ content: "", ranges: [] });
+  const historyRef = useRef(new ContentHistory(JSON.stringify(documentRef.current)));
+  const styleConflictRef = useRef(false);
+  const [styleConflict, setStyleConflict] = useState(false);
+  const saveQueueRef = useRef<Promise<void>>(Promise.resolve());
+  const revisionRef = useRef(0);
+  const activeIdRef = useRef<string | null>(null);
+  const commitDocument = useCallback((next: EditorDocument, typing = false) => {
+    historyRef.current.record(JSON.stringify(next), typing);
+    documentRef.current = next;
+    revisionRef.current++;
+    setContent(next.content); setRanges(next.ranges); setSaveState("dirty");
+  }, []);
+  const changeContent = useCallback((next: string, typing = false) => {
+    const current = documentRef.current;
+    commitDocument({ content: next, ranges: rebaseStyles(current.ranges, findTextEdit(current.content, next)) }, typing);
+  }, [commitDocument]);
+  const formatContent = useCallback((next: string) => changeContent(next), [changeContent]);
+  const restoreHistory = useCallback((redo: boolean) => {
+    const encoded = redo ? historyRef.current.redo() : historyRef.current.undo();
+    if (encoded === undefined) return;
+    const next: EditorDocument = JSON.parse(encoded);
+    documentRef.current = next; revisionRef.current++;
+    setContent(next.content); setRanges(next.ranges); setSaveState("dirty");
+  }, []);
+
+  useEffect(() => {
+    function handleUndo(event: KeyboardEvent) {
+      const target = event.target as HTMLElement;
+      if (!target.closest("[data-note-editor]")) return;
+      if (target.closest("textarea") && target !== contentRef.current) return;
+      if (!(event.ctrlKey || event.metaKey) || event.altKey || event.isComposing) return;
+      const key = event.key.toLowerCase();
+      if (key === "z" || key === "y") { event.preventDefault(); restoreHistory(key === "y" || event.shiftKey); }
+    }
+    document.addEventListener("keydown", handleUndo);
+    return () => document.removeEventListener("keydown", handleUndo);
+  }, [restoreHistory]);
+
+  const selectedNote = useMemo(
+    () => notes.find((note) => note.id === selectedId) ?? null,
+    [notes, selectedId],
+  );
+
+  const noteMenuTarget = useMemo(
+    () => notes.find((note) => note.id === noteMenu?.noteId) ?? null,
+    [noteMenu?.noteId, notes],
+  );
+
+  const filteredNotes = useMemo(
+    () => filterNotes(notes, searchQuery),
+    [notes, searchQuery],
+  );
+
+  const noteTree = useMemo(
+    () => buildNoteTree(filteredNotes),
+    [filteredNotes],
+  );
+
+  const lineCount = useMemo(() => content.split("\n").length, [content]);
+  const byteSize = useMemo(
+    () => (new TextEncoder().encode(content).length / 1024).toFixed(1),
+    [content],
+  );
+  const charCount = useMemo(() => countNoteChars(content), [content]);
+
+  const applyNote = useCallback((note: Note) => {
+    setSelectedId(note.id);
+    setTitle(note.title);
+    const migrated = migrateLegacyStyles(note.content);
+    const saved = note.styleDocument;
+    const conflict = !!saved && saved.content !== note.content;
+    const next = saved && !conflict ? saved : migrated;
+    styleConflictRef.current = conflict; setStyleConflict(conflict);
+    activeIdRef.current = note.id;
+    revisionRef.current++;
+    documentRef.current = next;
+    historyRef.current = new ContentHistory(JSON.stringify(next));
+    setContent(next.content); setRanges(next.ranges);
+    setSaveState("saved");
+    setErrorMessage(conflict ? "正文与保存的格式版本不同，旧格式已保留。当前笔记暂不可保存，请先恢复正文版本或备份后处理格式冲突。" : null);
+    setNoteTransitionKey((k) => k + 1);
+  }, []);
+
+  const replaceNoteMetadata = useCallback((note: Note) => {
+    const metadata = metadataFromNote(note);
+    setNotes((current) => {
+      const exists = current.some((item) => item.id === metadata.id);
+      const next = exists
+        ? current.map((item) => (item.id === metadata.id ? metadata : item))
+        : [metadata, ...current];
+      return [...next].sort((left, right) =>
+        right.updatedAt.localeCompare(left.updatedAt),
+      );
+    });
+  }, []);
+
+  const loadNote = useCallback(
+    async (id: string) => {
+      setErrorMessage(null);
+      const note = await getNote(id);
+      applyNote(note);
+      replaceNoteMetadata(note);
+    },
+    [applyNote, replaceNoteMetadata],
+  );
+
+  const refreshNotes = useCallback(async () => {
+    const loadedNotes = await listNotes();
+    setNotes(loadedNotes);
+    return loadedNotes;
+  }, []);
+
+  const clearCurrentNote = useCallback(() => {
+    setSelectedId(null);
+    setTitle("");
+    activeIdRef.current = null; revisionRef.current++;
+    styleConflictRef.current = false; setStyleConflict(false);
+    documentRef.current = { content: "", ranges: [] };
+    historyRef.current = new ContentHistory(JSON.stringify(documentRef.current));
+    setContent(""); setRanges([]);
+    setSaveState("idle");
+  }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+
+    async function bootstrap() {
+      setIsLoading(true);
+      try {
+        const loadedConfig = await getConfig();
+        const loadedNotes = await listNotes();
+        if (cancelled) return;
+        setSettingsConfig(loadedConfig);
+        setSavedNotesDir(loadedConfig.notesDir);
+        setViewMode(normalizeViewMode(loadedConfig.defaultViewMode));
+        setNotes(loadedNotes);
+        if (loadedNotes[0]) {
+          const note = await getNote(loadedNotes[0].id);
+          if (!cancelled) applyNote(note);
+        } else {
+          clearCurrentNote();
+        }
+      } catch (error) {
+        if (!cancelled) setErrorMessage(getErrorMessage(error));
+      } finally {
+        if (!cancelled) setIsLoading(false);
+      }
+    }
+
+    void bootstrap();
+    return () => {
+      cancelled = true;
+    };
+  }, [applyNote, clearCurrentNote]);
+
+  useEffect(() => {
+    function closeNoteMenu() {
+      setNoteMenuClosing(true);
+    }
+
+    function handleKeyDown(event: KeyboardEvent) {
+      if (event.key === "Escape") closeNoteMenu();
+    }
+
+    document.addEventListener("mousedown", closeNoteMenu);
+    document.addEventListener("keydown", handleKeyDown);
+    return () => {
+      document.removeEventListener("mousedown", closeNoteMenu);
+      document.removeEventListener("keydown", handleKeyDown);
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!noteMenuClosing || !noteMenu) return;
+    const timer = window.setTimeout(() => {
+      setNoteMenu(null);
+      setNoteMenuClosing(false);
+    }, 150);
+    return () => window.clearTimeout(timer);
+  }, [noteMenuClosing, noteMenu]);
+
+  const saveCurrentNote = useCallback(async () => {
+    if (!selectedId) return null;
+    if (styleConflictRef.current) { setErrorMessage("请先处理正文与格式的版本冲突，原格式文件尚未被覆盖。"); return null; }
+    const revision = revisionRef.current;
+    const snapshot = documentRef.current;
+    const previousSave = saveQueueRef.current;
+    let release!: () => void;
+    saveQueueRef.current = new Promise<void>(resolve => { release = resolve; });
+    setSaveState("saving");
+    try {
+      await previousSave;
+      const note = await updateNote(selectedId, { title, content: snapshot.content });
+      await saveNoteStyles(selectedId, snapshot);
+      replaceNoteMetadata(note);
+      if (activeIdRef.current !== selectedId) return note;
+      setSaveState(revisionRef.current === revision ? "saved" : "dirty");
+      setErrorMessage(null);
+      return note;
+    } catch (error) {
+      if (activeIdRef.current === selectedId) {
+        setSaveState("error");
+        setErrorMessage(getErrorMessage(error));
+      }
+      return null;
+    } finally { release(); }
+  }, [content, replaceNoteMetadata, selectedId, title]);
+
+  useEffect(() => {
+    function handleKeyDown(event: KeyboardEvent) {
+      if ((event.ctrlKey || event.metaKey) && event.key === "s") {
+        event.preventDefault();
+        void saveCurrentNote();
+      }
+    }
+
+    document.addEventListener("keydown", handleKeyDown);
+    return () => document.removeEventListener("keydown", handleKeyDown);
+  }, [saveCurrentNote]);
+
+  useEffect(() => {
+    if (!selectedId || saveState !== "dirty") return undefined;
+    if (!settingsConfig?.noteAutoSave) return undefined;
+
+    const timer = window.setTimeout(() => {
+      void saveCurrentNote();
+    }, 900);
+
+    return () => window.clearTimeout(timer);
+  }, [saveCurrentNote, saveState, selectedId, settingsConfig?.noteAutoSave]);
+
+  const handleNewNote = async () => {
+    setErrorMessage(null);
+    try {
+      const note = await createNote({ title: "", content: "" });
+      replaceNoteMetadata(note);
+      applyNote(note);
+    } catch (error) {
+      setErrorMessage(getErrorMessage(error));
+    }
+  };
+
+  const handleOpenSettings = async () => {
+    if (settingsOpen) {
+      setSettingsOpen(false);
+      return;
+    }
+    setSettingsOpen(true);
+    if (settingsConfig) return;
+
+    setErrorMessage(null);
+    try {
+      const config = await getConfig();
+      setSettingsConfig(config);
+      setSavedNotesDir(config.notesDir);
+      setViewMode(normalizeViewMode(config.defaultViewMode));
+    } catch (error) {
+      setErrorMessage(getErrorMessage(error));
+    }
+  };
+
+  const handleChooseNotesDir = async () => {
+    if (!settingsConfig) return;
+
+    setErrorMessage(null);
+    try {
+      const notesDir = await chooseNotesDirectory();
+      if (!notesDir) return;
+      handleSettingsChange({ ...settingsConfig, notesDir });
+    } catch (error) {
+      setErrorMessage(getErrorMessage(error));
+    }
+  };
+
+  const settingsSaveTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  const persistSettings = useCallback(
+    (nextConfig: AppConfig) => {
+      if (settingsSaveTimer.current) {
+        clearTimeout(settingsSaveTimer.current);
+      }
+      settingsSaveTimer.current = setTimeout(async () => {
+        const previousNotesDir = savedNotesDir ?? nextConfig.notesDir;
+        const normalizedConfig = {
+          ...nextConfig,
+          defaultViewMode: normalizeViewMode(nextConfig.defaultViewMode),
+          tileColor: normalizeTileColor(nextConfig.tileColor),
+        };
+        try {
+          const savedConfig = await saveConfig(normalizedConfig);
+          setSettingsConfig(savedConfig);
+          setSavedNotesDir(savedConfig.notesDir);
+          setViewMode(normalizeViewMode(savedConfig.defaultViewMode));
+
+          if (savedConfig.notesDir !== previousNotesDir) {
+            const loadedNotes = await refreshNotes();
+            if (loadedNotes[0]) {
+              await loadNote(loadedNotes[0].id);
+            } else {
+              clearCurrentNote();
+            }
+          }
+        } catch (error) {
+          setErrorMessage(getErrorMessage(error));
+        }
+      }, 300);
+    },
+    [savedNotesDir, refreshNotes, loadNote, clearCurrentNote],
+  );
+
+  const handleSettingsChange = useCallback(
+    (nextConfig: AppConfig) => {
+      setSettingsConfig(nextConfig);
+      void emit("config-changed", nextConfig);
+      persistSettings(nextConfig);
+    },
+    [persistSettings],
+  );
+
+  const handleCloseSettings = useCallback(() => {
+    setSettingsOpen(false);
+  }, []);
+
+  const handleImportNote = async () => {
+    setErrorMessage(null);
+    try {
+      if (selectedId && saveState === "dirty") {
+        const saved = await saveCurrentNote();
+        if (!saved) return;
+      }
+
+      const note = await importMarkdownNote();
+      if (!note) return;
+
+      replaceNoteMetadata(note);
+      applyNote(note);
+    } catch (error) {
+      setErrorMessage(getErrorMessage(error));
+    }
+  };
+
+  const handleSelectNote = async (id: string) => {
+    if (id === selectedId) return;
+    setDeleteConfirm(false);
+    if (saveState === "dirty") {
+      await saveCurrentNote();
+    }
+
+    try {
+      await loadNote(id);
+    } catch (error) {
+      setErrorMessage(getErrorMessage(error));
+    }
+  };
+
+  const handleDeleteNote = async (noteId = selectedId) => {
+    if (!noteId) return;
+
+    setDeleteConfirm(false);
+    setErrorMessage(null);
+    try {
+      await deleteNote(noteId);
+      const remaining = await refreshNotes();
+      if (noteId === selectedId && remaining[0]) {
+        await loadNote(remaining[0].id);
+      } else if (noteId === selectedId) {
+        clearCurrentNote();
+      }
+    } catch (error) {
+      setErrorMessage(getErrorMessage(error));
+    }
+  };
+
+  const handleCreateChildNote = async (parentId: string) => {
+    setErrorMessage(null);
+    try {
+      const note = await createNote({ title: "", content: "", parentId });
+      replaceNoteMetadata(note);
+      applyNote(note);
+    } catch (error) {
+      setErrorMessage(getErrorMessage(error));
+    }
+  };
+
+  const handleMoveNote = async (
+    noteId: string,
+    newParentId: string | null,
+    newSortOrder: number,
+  ) => {
+    setErrorMessage(null);
+    try {
+      await moveNote(noteId, newParentId, newSortOrder);
+      await refreshNotes();
+    } catch (error) {
+      setErrorMessage(getErrorMessage(error));
+    }
+  };
+
+  const handleOpenNoteMenu = (
+    event: MouseEvent<HTMLElement>,
+    noteId: string,
+  ) => {
+    event.preventDefault();
+    event.stopPropagation();
+
+    const menuWidth = 168;
+    const menuHeight = 112;
+    const x = Math.min(event.clientX, window.innerWidth - menuWidth - 4);
+    const y = Math.min(event.clientY, window.innerHeight - menuHeight - 4);
+
+    setNoteMenuClosing(false);
+    setHoveredId(noteId);
+    setNoteMenu({
+      x: Math.max(4, x),
+      y: Math.max(4, y),
+      noteId,
+    });
+  };
+
+  const handleExportNote = async (note: NoteMetadata) => {
+    setErrorMessage(null);
+    try {
+      if (note.id === selectedId && saveState === "dirty") {
+        const saved = await saveCurrentNote();
+        if (!saved) return;
+      }
+
+      await exportMarkdownNote({
+        id: note.id,
+        title: note.id === selectedId ? title : note.title,
+      });
+    } catch (error) {
+      setErrorMessage(getErrorMessage(error));
+    }
+  };
+
+  const handleNoteMenuAction = (action: NoteContextMenuAction) => {
+    const note = noteMenuTarget;
+    setNoteMenuClosing(true);
+    if (!note) return;
+
+    if (action === "newChild") {
+      void handleCreateChildNote(note.id);
+      return;
+    }
+
+    if (action === "export") {
+      void handleExportNote(note);
+      return;
+    }
+
+    void handleDeleteNote(note.id);
+  };
+
+  const markDirty = () => {
+    if (selectedId) setSaveState("dirty");
+  };
+
+  const handleOpenNotepad = async () => {
+    setErrorMessage(null);
+    try {
+      await openNotepadWindow();
+    } catch (error) {
+      setErrorMessage(getErrorMessage(error));
+    }
+  };
+
+  const [isMaximized, setIsMaximized] = useState(false);
+
+  useEffect(() => {
+    void isCurrentWindowMaximized().then(setIsMaximized);
+  }, []);
+
+  const handlePinEntry = async () => {
+    if (!selectedId) return;
+    if (saveState === "dirty") {
+      await saveCurrentNote();
+    }
+
+    setErrorMessage(null);
+    try {
+      await openTileWindow(selectedId);
+    } catch (error) {
+      setErrorMessage(getErrorMessage(error));
+    }
+  };
+
+  const handleTitleBarDrag = (event: MouseEvent<HTMLDivElement>) => {
+    if ((event.target as HTMLElement).closest("button")) return;
+    void startCurrentWindowDrag().catch(() => undefined);
+  };
+
+  const toggleMaximize = () => {
+    void toggleMaximizeCurrentWindow().then(() =>
+      isCurrentWindowMaximized().then(setIsMaximized),
+    );
+  };
+
+  const handleTitleBarDoubleClick = (event: MouseEvent<HTMLDivElement>) => {
+    if ((event.target as HTMLElement).closest("button")) return;
+    toggleMaximize();
+  };
+
+  const handleMinimize = () => {
+    void minimizeCurrentWindow();
+  };
+
+  const handleMaximize = () => {
+    toggleMaximize();
+  };
+
+  const handleClose = () => {
+    void closeCurrentWindow();
+  };
+
+  const handleSidebarResize = useCallback((delta: number) => {
+    setSidebarWidth((prev) =>
+      Math.max(
+        MIN_SIDEBAR_WIDTH,
+        Math.min(prev + delta, window.innerWidth - MIN_EDITOR_WIDTH),
+      ),
+    );
+  }, []);
+
+  const handleSplitResize = useCallback((delta: number) => {
+    setSplitRatio((prev) => {
+      const totalWidth = window.innerWidth - sidebarWidth;
+      if (totalWidth <= 0) return prev;
+      const minFraction = MIN_EDITOR_WIDTH / totalWidth;
+      const maxFraction = 1 - MIN_PREVIEW_WIDTH / totalWidth;
+      const newRatio = prev + delta / totalWidth;
+      return Math.max(minFraction, Math.min(maxFraction, newRatio));
+    });
+  }, [sidebarWidth]);
+
+  return (
+    <div className="w-full h-screen flex flex-col">
+      <div className="noise-bg bg-cloud overflow-hidden flex flex-col flex-1">
+        <div
+          className="flex items-center justify-between pl-5 pr-0 h-11 bg-paper/60 border-b border-paper-deep/30 shrink-0 select-none cursor-grab active:cursor-grabbing"
+          onMouseDown={handleTitleBarDrag}
+          onDoubleClick={handleTitleBarDoubleClick}
+        >
+          <div className="flex items-center gap-3 min-w-0">
+            <span className="text-[13px] font-display font-medium text-ink-soft tracking-wide">
+              花笺
+            </span>
+            <span className="text-[11px] text-ink-ghost font-body">—</span>
+            <span className="text-[11px] text-ink-faint font-body truncate max-w-[240px]">
+              {title || selectedNote?.preview || "无标题笔记"}
+            </span>
+          </div>
+          <div className="flex items-center">
+            {errorMessage && (
+              <span className="max-w-[200px] truncate text-[11px] text-red-400 mr-2">
+                {errorMessage}
+                {styleConflict && <button className="ml-3 underline cursor-pointer" onClick={() => {
+                  styleConflictRef.current = false; setStyleConflict(false); setErrorMessage(null);
+                  commitDocument({ ...documentRef.current, ranges: [] });
+                }}>保留当前正文并重置格式</button>}
+              </span>
+            )}
+            <button
+              onClick={() => void handleOpenNotepad()}
+              className="w-10 h-11 flex items-center justify-center text-ink-ghost hover:text-bamboo hover:bg-bamboo-mist/50 transition-all cursor-pointer"
+              title="快捷便签"
+            >
+              <svg
+                width="14"
+                height="14"
+                viewBox="0 0 24 24"
+                fill="none"
+                stroke="currentColor"
+                strokeWidth="2"
+                strokeLinecap="round"
+                strokeLinejoin="round"
+              >
+                <path d="M4 4h16v14H7l-3 3V4z" />
+                <path d="M8 9h8M8 13h5" />
+              </svg>
+            </button>
+            <button
+              onClick={() => void handleOpenSettings()}
+              className="w-10 h-11 flex items-center justify-center text-ink-ghost hover:text-ink-faint hover:bg-paper-warm transition-all cursor-pointer"
+              title="设置"
+            >
+              <svg
+                width="14"
+                height="14"
+                viewBox="0 0 24 24"
+                fill="none"
+                stroke="currentColor"
+                strokeWidth="2"
+                strokeLinecap="round"
+                strokeLinejoin="round"
+              >
+                <circle cx="12" cy="12" r="3" />
+                <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z" />
+              </svg>
+            </button>
+
+            <div className="w-px h-4 bg-paper-deep/30 mx-0.5" />
+
+            <button
+              onClick={handleMinimize}
+              className="w-11 h-11 flex items-center justify-center text-ink-ghost hover:text-ink-soft hover:bg-paper-warm transition-all cursor-pointer"
+              title="最小化"
+            >
+              <svg width="12" height="12" viewBox="0 0 12 12">
+                <rect x="1" y="5.5" width="10" height="1" fill="currentColor" rx="0.5" />
+              </svg>
+            </button>
+            <button
+              onClick={handleMaximize}
+              className="w-11 h-11 flex items-center justify-center text-ink-ghost hover:text-ink-soft hover:bg-paper-warm transition-all cursor-pointer"
+              title={isMaximized ? "还原" : "最大化"}
+            >
+              {isMaximized ? (
+                <svg width="12" height="12" viewBox="0 0 12 12" fill="none" stroke="currentColor" strokeWidth="1.2">
+                  <rect x="3" y="3" width="7" height="7" rx="1" />
+                  <path d="M3 5H2V2a1 1 0 0 1 1-1h5v1" />
+                </svg>
+              ) : (
+                <svg width="12" height="12" viewBox="0 0 12 12" fill="none" stroke="currentColor" strokeWidth="1.2">
+                  <rect x="1.5" y="1.5" width="9" height="9" rx="1.5" />
+                </svg>
+              )}
+            </button>
+            <button
+              onClick={handleClose}
+              className="w-11 h-11 flex items-center justify-center text-ink-ghost hover:text-red-500 hover:bg-danger-bg transition-all cursor-pointer"
+              title="关闭"
+            >
+              <svg width="12" height="12" viewBox="0 0 12 12" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round">
+                <path d="M2 2l8 8M10 2l-8 8" />
+              </svg>
+            </button>
+          </div>
+        </div>
+
+        <div className="flex flex-1 min-h-0">
+          <div
+            className={`border-r border-paper-deep/30 bg-paper/40 flex flex-col shrink-0 overflow-hidden ${
+              sidebarCollapsed ? "w-0" : ""
+            }`}
+            style={{
+              width: sidebarCollapsed ? 0 : sidebarWidth,
+              transition: sidebarCollapsed ? "width 600ms" : "none",
+            }}
+          >
+            <div className="px-3 pt-3 pb-2 shrink-0">
+              <div className="flex items-center gap-2 px-2.5 h-8 rounded-lg bg-paper-warm/80 border border-paper-deep/40 focus-within:border-bamboo/30 focus-within:bg-cloud transition-all">
+                <svg
+                  width="13"
+                  height="13"
+                  viewBox="0 0 24 24"
+                  fill="none"
+                  stroke="currentColor"
+                  strokeWidth="2.5"
+                  strokeLinecap="round"
+                  className="text-ink-ghost shrink-0"
+                >
+                  <circle cx="11" cy="11" r="8" />
+                  <path d="m21 21-4.35-4.35" />
+                </svg>
+                <input
+                  type="text"
+                  value={searchQuery}
+                  onChange={(event) => setSearchQuery(event.target.value)}
+                  placeholder="搜索笔记…"
+                  className="flex-1 text-[12px] font-body text-ink placeholder:text-ink-ghost/60 bg-transparent"
+                />
+                {searchQuery && (
+                  <button
+                    onClick={() => setSearchQuery("")}
+                    className="text-ink-ghost hover:text-ink-faint transition-colors cursor-pointer"
+                    title="清空搜索"
+                  >
+                    <svg
+                      width="10"
+                      height="10"
+                      viewBox="0 0 24 24"
+                      fill="none"
+                      stroke="currentColor"
+                      strokeWidth="3"
+                      strokeLinecap="round"
+                    >
+                      <path d="M18 6L6 18M6 6l12 12" />
+                    </svg>
+                  </button>
+                )}
+              </div>
+            </div>
+
+            <div className="px-3 pb-2 shrink-0 space-y-1">
+              <button
+                onClick={handleNewNote}
+                className="w-full flex items-center gap-2 px-2.5 py-1.5 rounded-lg text-[12px] font-body text-bamboo hover:bg-bamboo-mist/60 transition-all cursor-pointer group"
+              >
+                <svg
+                  width="13"
+                  height="13"
+                  viewBox="0 0 24 24"
+                  fill="none"
+                  stroke="currentColor"
+                  strokeWidth="2.5"
+                  strokeLinecap="round"
+                  className="group-hover:rotate-90 transition-transform duration-200"
+                >
+                  <path d="M12 5v14M5 12h14" />
+                </svg>
+                <span>新建笔记</span>
+              </button>
+              <button
+                onClick={() => void handleImportNote()}
+                className="w-full flex items-center gap-2 px-2.5 py-1.5 rounded-lg text-[12px] font-body text-ink-faint hover:text-bamboo hover:bg-bamboo-mist/50 transition-all cursor-pointer group"
+              >
+                <svg
+                  width="13"
+                  height="13"
+                  viewBox="0 0 24 24"
+                  fill="none"
+                  stroke="currentColor"
+                  strokeWidth="2.2"
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                >
+                  <path d="M12 3v12" />
+                  <path d="m7 8 5-5 5 5" />
+                  <path d="M5 21h14" />
+                </svg>
+                <span>导入 Markdown</span>
+              </button>
+            </div>
+
+            <div className="px-5 pb-1.5 shrink-0">
+              <span className="text-[10px] text-ink-ghost font-mono tracking-wider uppercase">
+                {filteredNotes.length} 篇笔记
+              </span>
+            </div>
+
+            {!isLoading && filteredNotes.length > 0 ? (
+              <NoteTree
+                notes={noteTree}
+                selectedId={selectedId}
+                hoveredId={hoveredId}
+                onSelectNote={(id) => void handleSelectNote(id)}
+                onHoverNote={setHoveredId}
+                onContextMenu={(event, noteId) =>
+                  handleOpenNoteMenu(
+                    event as unknown as MouseEvent<HTMLElement>,
+                    noteId,
+                  )
+                }
+                onCreateChild={handleCreateChildNote}
+                onMoveNote={handleMoveNote}
+              />
+            ) : !isLoading ? (
+              <div className="px-3 py-8 text-center text-[12px] text-ink-ghost leading-relaxed">
+                {searchQuery ? "没有匹配的笔记" : "还没有笔记"}
+              </div>
+            ) : null}
+          </div>
+
+          {!sidebarCollapsed && (
+            <ResizeHandle onDrag={handleSidebarResize} />
+          )}
+
+          <div className="flex-1 flex flex-col min-w-0">
+            <div className="flex items-center justify-between px-4 h-10 border-b border-paper-deep/20 shrink-0 bg-paper/20">
+              <div className="flex items-center gap-1">
+                <button
+                  onClick={() => setSidebarCollapsed(!sidebarCollapsed)}
+                  className="w-7 h-7 flex items-center justify-center rounded-lg text-ink-ghost hover:text-ink-faint hover:bg-paper-warm transition-all cursor-pointer"
+                  title={sidebarCollapsed ? "展开侧栏" : "收起侧栏"}
+                >
+                  <svg
+                    width="14"
+                    height="14"
+                    viewBox="0 0 24 24"
+                    fill="none"
+                    stroke="currentColor"
+                    strokeWidth="2"
+                    strokeLinecap="round"
+                    strokeLinejoin="round"
+                  >
+                    <rect x="3" y="3" width="18" height="18" rx="2" ry="2" />
+                    <line x1="9" y1="3" x2="9" y2="21" />
+                  </svg>
+                </button>
+
+                <div className="h-4 w-px bg-paper-deep/30 mx-1" />
+
+                <button
+                  onClick={() => void handlePinEntry()}
+                  disabled={!selectedId}
+                  className="w-7 h-7 flex items-center justify-center rounded-lg text-ink-ghost hover:text-bamboo hover:bg-bamboo-mist/50 transition-all cursor-pointer disabled:opacity-30 disabled:cursor-not-allowed"
+                  title="钉为磁贴"
+                >
+                  <svg
+                    width="13"
+                    height="13"
+                    viewBox="0 0 24 24"
+                    fill="none"
+                    stroke="currentColor"
+                    strokeWidth="2"
+                    strokeLinecap="round"
+                    strokeLinejoin="round"
+                  >
+                    <path d="M12 17v5" />
+                    <path d="M9 10.76a2 2 0 0 1-1.11 1.79l-1.78.9A2 2 0 0 0 5 15.24V16a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1v-.76a2 2 0 0 0-1.11-1.79l-1.78-.9A2 2 0 0 1 15 10.76V7a1 1 0 0 1 1-1 1 1 0 0 0 1-1V4a1 1 0 0 0-1-1H8a1 1 0 0 0-1 1v1a1 1 0 0 0 1 1 1 1 0 0 1 1 1z" />
+                  </svg>
+                </button>
+
+                <button
+                  onClick={() => void saveCurrentNote()}
+                  disabled={!selectedId || saveState === "saving"}
+                  className="px-2.5 h-7 flex items-center justify-center rounded-lg text-[11px] text-ink-ghost hover:text-ink-faint hover:bg-paper-warm transition-all cursor-pointer disabled:opacity-30 disabled:cursor-not-allowed"
+                  title="保存"
+                >
+                  保存
+                </button>
+
+                {deleteConfirm ? (
+                  <div className={`flex items-center gap-1 ml-1 ${deleteExiting ? "animate-delete-confirm-exit" : "animate-delete-confirm"}`}>
+                    <span className="text-[11px] text-red-400 whitespace-nowrap">确认删除？</span>
+                    <button
+                      onClick={() => {
+                        setDeleteExiting(true);
+                        setTimeout(() => {
+                          setDeleteExiting(false);
+                          setDeleteConfirm(false);
+                          void handleDeleteNote();
+                        }, 150);
+                      }}
+                      className="px-2 h-6 rounded-md text-[11px] text-cloud bg-red-400 hover:bg-red-500 transition-colors cursor-pointer whitespace-nowrap"
+                    >
+                      删除
+                    </button>
+                    <button
+                      onClick={() => {
+                        setDeleteExiting(true);
+                        setTimeout(() => {
+                          setDeleteExiting(false);
+                          setDeleteConfirm(false);
+                        }, 150);
+                      }}
+                      className="px-2 h-6 rounded-md text-[11px] text-ink-faint hover:text-ink-soft hover:bg-paper-warm transition-colors cursor-pointer"
+                    >
+                      取消
+                    </button>
+                  </div>
+                ) : (
+                  <button
+                    onClick={() => setDeleteConfirm(true)}
+                    disabled={!selectedId}
+                    className="w-7 h-7 flex items-center justify-center rounded-lg text-ink-ghost hover:text-red-400 hover:bg-danger-bg transition-all cursor-pointer disabled:opacity-30 disabled:cursor-not-allowed"
+                    title="删除笔记"
+                  >
+                    <svg
+                      width="13"
+                      height="13"
+                      viewBox="0 0 24 24"
+                      fill="none"
+                      stroke="currentColor"
+                      strokeWidth="2"
+                      strokeLinecap="round"
+                      strokeLinejoin="round"
+                    >
+                      <polyline points="3,6 5,6 21,6" />
+                      <path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2" />
+                    </svg>
+                  </button>
+                )}
+              </div>
+
+              <SlidingButtonGroup
+                options={[
+                  { value: "edit" as ViewMode, label: "编辑" },
+                  { value: "split" as ViewMode, label: "分栏" },
+                  { value: "preview" as ViewMode, label: "预览" },
+                ]}
+                value={viewMode}
+                onChange={setViewMode}
+                buttonClassName="px-3 py-1"
+              />
+            </div>
+
+            <div key={noteTransitionKey} className="animate-note-enter px-6 pt-4 pb-2 shrink-0 border-b border-paper-deep/15">
+              <input
+                type="text"
+                value={title}
+                onChange={(event) => {
+                  setTitle(event.target.value);
+                  markDirty();
+                }}
+                onKeyDown={(event) => {
+                  if (event.key === "Enter") {
+                    event.preventDefault();
+                    contentRef.current?.focus();
+                  }
+                }}
+                placeholder="无标题笔记"
+                disabled={!selectedId}
+                className="w-full text-[20px] font-display font-bold text-ink placeholder:text-ink-ghost/50 tracking-wide disabled:opacity-60"
+              />
+              <div className="flex items-center gap-3 mt-1.5">
+                <span className="text-[10px] text-ink-ghost font-mono tabular-nums">
+                  {selectedNote ? `${formatShortDate(selectedNote.updatedAt)} ${formatTime(selectedNote.updatedAt)}` : "--"}
+                </span>
+                <span className="text-[10px] text-ink-ghost/40">·</span>
+                <span className="text-[10px] text-ink-ghost font-mono tabular-nums">
+                  {charCount} 字
+                </span>
+                <span className="text-[10px] text-ink-ghost/40">·</span>
+                <span
+                  key={saveState}
+                  className={`text-[10px] font-mono tabular-nums animate-status-fade ${
+                    saveState === "error"
+                      ? "text-red-400"
+                      : saveState === "dirty"
+                        ? "text-amber-500/70"
+                        : "text-bamboo/60"
+                  }`}
+                >
+                  {saveStateLabel[saveState]}
+                </span>
+              </div>
+            </div>
+
+            <div data-note-editor key={viewMode} className="flex-1 flex min-h-0 animate-view-fade">
+              {!selectedId && !isLoading ? (
+                <div className="flex-1 flex items-center justify-center text-[13px] text-ink-ghost">
+                  选择或新建一篇笔记
+                </div>
+              ) : (
+                <>
+                  {(viewMode === "edit" || viewMode === "split") && (
+                    <div
+                      className="flex flex-col min-h-0"
+                      style={{
+                        width: viewMode === "split" ? `${splitRatio * 100}%` : "100%",
+                      }}
+                    >
+                      <div className="flex items-center flex-wrap gap-1 px-4 pt-2 pb-2 shrink-0 border-b border-paper-deep/50" role="toolbar" aria-label="Markdown 格式">
+                        <select aria-label="段落样式" defaultValue="" onChange={(e) => { if (contentRef.current && e.target.value) applyHeading(contentRef.current, e.target.value, formatContent, markDirty); e.target.value = ""; }} className="format-select"><option value="" disabled>段落</option><option value="0">正文</option>{[1,2,3,4,5,6].map(n => <option key={n} value={n}>标题 {n}</option>)}</select>
+                        {toolbarButtons.map((button) => (
+                          <button
+                            key={button.label}
+                            title={button.title}
+                            onMouseDown={(e) => e.preventDefault()}
+                            onClick={() => {
+                              if (contentRef.current) {
+                                applyFormat(contentRef.current, button.action, formatContent, markDirty);
+                              }
+                            }}
+                            className={`w-7 h-7 flex items-center justify-center rounded text-[13px] text-ink-soft hover:text-ink hover:bg-paper-warm transition-all cursor-pointer ${button.style}`}
+                          >
+                            {button.label}
+                          </button>
+                        ))}
+                      </div>
+
+                      <div className="flex-1 overflow-y-auto px-5 pb-4">
+                        <textarea
+                          ref={contentRef}
+                          value={content}
+                          onChange={(event) => {
+                            changeContent(event.target.value, true);
+                            markDirty();
+                          }}
+                          className="w-full h-full leading-[1.9] text-ink-soft font-mono placeholder:text-ink-ghost/40"
+                          style={{ fontSize: `${settingsConfig?.fontSize ?? 14}px` }}
+                          placeholder="开始写作……"
+                          spellCheck={false}
+                          disabled={!selectedId}
+                        />
+                      </div>
+                    </div>
+                  )}
+
+                  {viewMode === "split" && (
+                    <ResizeHandle onDrag={handleSplitResize} />
+                  )}
+
+                  {(viewMode === "preview" || viewMode === "split") && (
+                    <div
+                      className="flex flex-col min-h-0"
+                      style={{
+                        width: viewMode === "split"
+                          ? `${(1 - splitRatio) * 100}%`
+                          : "100%",
+                      }}
+                    >
+                      {viewMode === "split" && (
+                        <div className="px-4 pt-2.5 pb-1 shrink-0">
+                          <span className="text-[10px] text-ink-ghost/60 font-mono tracking-widest uppercase">
+                            Preview
+                          </span>
+                        </div>
+                      )}
+                      <div
+                        className={`flex-1 overflow-y-auto px-6 pb-6 ${
+                          viewMode === "preview" ? "pt-3" : "pt-1"
+                        }`}
+                      >
+                        <MarkdownPreview
+                          key={selectedId}
+                          content={content}
+                          ranges={ranges}
+                          onUndo={() => restoreHistory(false)}
+                          onRedo={() => restoreHistory(true)}
+                          onStyle={(start, end, property, value) => commitDocument({ ...documentRef.current, ranges: setRangeStyle(documentRef.current.ranges, start, end, property, value) })}
+                          onEdit={(start, end, text) => { const current = documentRef.current; commitDocument({ content: current.content.slice(0,start) + text + current.content.slice(end), ranges: rebaseStyles(current.ranges, { start, end, text }) }); }}
+                          fontSize={settingsConfig?.fontSize ?? 14}
+                          notesDir={settingsConfig?.notesDir}
+                        />
+                      </div>
+                    </div>
+                  )}
+                </>
+              )}
+            </div>
+
+            <div className="flex items-center justify-between px-4 h-7 border-t border-paper-deep/20 bg-paper/30 shrink-0">
+              <div className="flex items-center gap-3">
+                <span className="text-[10px] text-ink-ghost font-mono tabular-nums">
+                  Ln {lineCount}
+                </span>
+                <span className="text-[10px] text-ink-ghost/40">|</span>
+                <span className="text-[10px] text-ink-ghost font-mono">
+                  Markdown
+                </span>
+              </div>
+              <div className="flex items-center gap-3">
+                <span className="text-[10px] text-ink-ghost font-mono">
+                  UTF-8
+                </span>
+                <span className="text-[10px] text-ink-ghost/40">|</span>
+                <span className="text-[10px] text-ink-ghost font-mono tabular-nums">
+                  {byteSize} KB
+                </span>
+              </div>
+            </div>
+          </div>
+          {settingsConfig && (
+            <div className={`relative shrink-0 transition-all duration-[600ms] overflow-hidden h-full ${
+              settingsOpen ? "w-[360px]" : "w-0"
+            }`}>
+              <div className="w-[360px] h-full">
+                <SettingsPanel
+                  config={settingsConfig}
+                  onChange={handleSettingsChange}
+                  onChooseNotesDir={() => void handleChooseNotesDir()}
+                  onClose={handleCloseSettings}
+                />
+              </div>
+            </div>
+          )}
+        </div>
+      </div>
+      {noteMenu && noteMenuTarget && (
+        <div
+          className={`fixed z-[9999] min-w-[168px] py-1.5 bg-cloud/95 backdrop-blur-sm border border-paper-deep/50 rounded-lg overflow-hidden select-none ${noteMenuClosing ? "animate-menu-exit" : "animate-menu-enter"}`}
+          style={{ left: noteMenu.x, top: noteMenu.y }}
+          onMouseDown={(event) => event.stopPropagation()}
+        >
+          {noteContextMenuItems.map((item) => (
+            <button
+              key={item.action}
+              onClick={() => handleNoteMenuAction(item.action)}
+              className={`w-full flex items-center justify-between px-3 py-1.5 text-[12px] font-body transition-colors cursor-pointer ${
+                item.tone === "danger"
+                  ? "text-red-400 hover:bg-danger-bg hover:text-red-500"
+                  : "text-ink-soft hover:bg-bamboo-mist/60 hover:text-bamboo"
+              } ${item.separator ? "border-t border-paper-deep/40 mt-1 pt-2" : ""}`}
+            >
+              <span>{item.label}</span>
+            </button>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}

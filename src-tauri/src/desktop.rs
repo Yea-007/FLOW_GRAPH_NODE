@@ -1,0 +1,1019 @@
+use crate::services::notes::{default_store, AppConfig, AppError};
+use serde::Deserialize;
+use std::{
+    error::Error,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Mutex,
+    },
+};
+use tauri::{
+    menu::{CheckMenuItem, Menu, MenuItem, PredefinedMenuItem},
+    tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
+    App, AppHandle, Emitter, Manager, PhysicalPosition, PhysicalSize, WebviewUrl,
+    WebviewWindowBuilder, Window, WindowEvent,
+};
+use uuid::Uuid;
+
+#[cfg(desktop)]
+use tauri_plugin_autostart::{MacosLauncher, ManagerExt as AutostartExt};
+#[cfg(desktop)]
+use tauri_plugin_global_shortcut::{Code, GlobalShortcutExt, Modifiers, Shortcut, ShortcutState};
+
+const MAIN_WINDOW_LABEL: &str = "main";
+const TRAY_SHOW_MAIN_ID: &str = "show-main";
+const TRAY_QUICK_NOTE_ID: &str = "quick-note";
+const TRAY_TOGGLE_CLOSE_TO_TRAY_ID: &str = "toggle-close-to-tray";
+const TRAY_TOGGLE_AUTOSTART_ID: &str = "toggle-autostart";
+const TRAY_QUIT_ID: &str = "quit";
+const NOTEPAD_POOL_CAPACITY: usize = 2;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TrayMenuAction {
+    ShowMain,
+    QuickNote,
+    ToggleCloseToTray,
+    ToggleAutostart,
+    Quit,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TrayMenuSpec {
+    pub id: &'static str,
+    pub label: &'static str,
+    pub checked: Option<bool>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShortcutModifier {
+    Control,
+    Alt,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShortcutKey {
+    Space,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RuntimeConfigChanges {
+    pub autostart_changed: bool,
+    pub global_shortcut_changed: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ShortcutSpec {
+    pub modifier: ShortcutModifier,
+    pub key: ShortcutKey,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DynamicWindowVisualOptions {
+    pub transparent: bool,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct WindowBounds {
+    pub x: i32,
+    pub y: i32,
+    pub width: u32,
+    pub height: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct WindowSizeSpec {
+    width: f64,
+    height: f64,
+    min_width: f64,
+    min_height: f64,
+}
+
+#[derive(Default)]
+struct RuntimeState {
+    is_exiting: AtomicBool,
+}
+
+#[derive(Default)]
+struct NotepadPool {
+    available: Mutex<Vec<String>>,
+}
+
+impl NotepadPool {
+    fn take(&self) -> Option<String> {
+        self.available.lock().ok()?.pop()
+    }
+
+    fn put(&self, label: String) -> bool {
+        if let Ok(mut available) = self.available.lock() {
+            if available.len() < NOTEPAD_POOL_CAPACITY {
+                available.push(label);
+                return true;
+            }
+        }
+        false
+    }
+
+    fn is_below_capacity(&self) -> bool {
+        self.available
+            .lock()
+            .map(|a| a.len() < NOTEPAD_POOL_CAPACITY)
+            .unwrap_or(false)
+    }
+}
+
+impl RuntimeState {
+    fn allow_exit(&self) {
+        self.is_exiting.store(true, Ordering::SeqCst);
+    }
+
+    fn is_exiting(&self) -> bool {
+        self.is_exiting.load(Ordering::SeqCst)
+    }
+}
+
+pub fn tray_menu_action(id: &str) -> Option<TrayMenuAction> {
+    match id {
+        TRAY_SHOW_MAIN_ID => Some(TrayMenuAction::ShowMain),
+        TRAY_QUICK_NOTE_ID => Some(TrayMenuAction::QuickNote),
+        TRAY_TOGGLE_CLOSE_TO_TRAY_ID => Some(TrayMenuAction::ToggleCloseToTray),
+        TRAY_TOGGLE_AUTOSTART_ID => Some(TrayMenuAction::ToggleAutostart),
+        TRAY_QUIT_ID => Some(TrayMenuAction::Quit),
+        _ => None,
+    }
+}
+
+pub fn tray_menu_specs(close_to_tray: bool, autostart: bool) -> Vec<TrayMenuSpec> {
+    vec![
+        TrayMenuSpec {
+            id: TRAY_SHOW_MAIN_ID,
+            label: "打开主窗口",
+            checked: None,
+        },
+        TrayMenuSpec {
+            id: TRAY_QUICK_NOTE_ID,
+            label: "快速记录",
+            checked: None,
+        },
+        TrayMenuSpec {
+            id: TRAY_TOGGLE_CLOSE_TO_TRAY_ID,
+            label: "关闭到托盘",
+            checked: Some(close_to_tray),
+        },
+        TrayMenuSpec {
+            id: TRAY_TOGGLE_AUTOSTART_ID,
+            label: "开机自启动",
+            checked: Some(autostart),
+        },
+        TrayMenuSpec {
+            id: TRAY_QUIT_ID,
+            label: "退出",
+            checked: None,
+        },
+    ]
+}
+
+pub fn shortcut_from_config(value: &str) -> Option<ShortcutSpec> {
+    let parts: Vec<_> = value
+        .split('+')
+        .map(|part| part.trim().to_ascii_lowercase())
+        .filter(|part| !part.is_empty())
+        .collect();
+
+    if parts.len() != 2 {
+        return None;
+    }
+
+    let modifier = match parts[0].as_str() {
+        "ctrl" | "control" | "cmdorctrl" | "commandorcontrol" => ShortcutModifier::Control,
+        "alt" | "option" => ShortcutModifier::Alt,
+        _ => return None,
+    };
+
+    let key = match parts[1].as_str() {
+        "space" => ShortcutKey::Space,
+        _ => return None,
+    };
+
+    Some(ShortcutSpec { modifier, key })
+}
+
+pub fn runtime_config_changes(previous: &AppConfig, next: &AppConfig) -> RuntimeConfigChanges {
+    RuntimeConfigChanges {
+        autostart_changed: previous.autostart != next.autostart,
+        global_shortcut_changed: previous.global_shortcut != next.global_shortcut,
+    }
+}
+
+pub fn apply_runtime_config(
+    app: &AppHandle,
+    previous: &AppConfig,
+    next: &AppConfig,
+) -> Result<(), Box<dyn Error>> {
+    let changes = runtime_config_changes(previous, next);
+
+    if changes.global_shortcut_changed {
+        apply_global_shortcut_config(app, &next.global_shortcut)?;
+    }
+
+    if changes.autostart_changed {
+        apply_autostart(app, next.autostart)?;
+    }
+
+    Ok(())
+}
+
+pub async fn open_notepad_window(
+    app: AppHandle,
+    note_id: Option<String>,
+    bounds: Option<WindowBounds>,
+) -> Result<String, AppError> {
+    open_notepad_window_now(&app, note_id.as_deref(), bounds)
+}
+
+pub async fn open_tile_window(
+    app: AppHandle,
+    note_id: String,
+    bounds: Option<WindowBounds>,
+) -> Result<String, AppError> {
+    open_tile_window_now(&app, &note_id, bounds)
+}
+
+pub fn setup_desktop(app: &mut App) -> Result<(), Box<dyn Error>> {
+    app.manage(RuntimeState::default());
+    app.manage(NotepadPool::default());
+    setup_autostart_plugin(app.handle())?;
+    setup_global_shortcut_plugin(app.handle())?;
+    sync_autostart_to_config(app.handle());
+    register_configured_global_shortcut(app.handle());
+    setup_tray(app)?;
+    schedule_notepad_prewarm(app.handle());
+
+    if !std::env::args().any(|a| a == "--silent") {
+        if let Err(error) = show_main_window(app.handle()) {
+            eprintln!("failed to show main window on startup: {error}");
+        }
+    }
+
+    Ok(())
+}
+
+pub fn handle_window_event(window: &Window, event: &WindowEvent) {
+    if window.label() != MAIN_WINDOW_LABEL {
+        return;
+    }
+
+    let WindowEvent::CloseRequested { api, .. } = event else {
+        return;
+    };
+
+    if app_is_exiting(window.app_handle()) || !close_to_tray_enabled() {
+        return;
+    }
+
+    api.prevent_close();
+    if let Err(error) = window.hide() {
+        eprintln!("failed to hide main window to tray: {error}");
+    }
+}
+
+fn setup_tray(app: &mut App) -> Result<(), Box<dyn Error>> {
+    let config = load_config()?;
+    let autostart = autostart_enabled(app.handle(), config.autostart);
+    let specs = tray_menu_specs(config.close_to_tray, autostart);
+
+    let show_main = MenuItem::with_id(app, specs[0].id, specs[0].label, true, None::<&str>)?;
+    let quick_note = MenuItem::with_id(app, specs[1].id, specs[1].label, true, None::<&str>)?;
+    let close_to_tray = CheckMenuItem::with_id(
+        app,
+        specs[2].id,
+        specs[2].label,
+        true,
+        specs[2].checked.unwrap_or(false),
+        None::<&str>,
+    )?;
+    let autostart = CheckMenuItem::with_id(
+        app,
+        specs[3].id,
+        specs[3].label,
+        true,
+        specs[3].checked.unwrap_or(false),
+        None::<&str>,
+    )?;
+    let separator = PredefinedMenuItem::separator(app)?;
+    let quit = MenuItem::with_id(app, specs[4].id, specs[4].label, true, None::<&str>)?;
+    let menu = Menu::with_items(
+        app,
+        &[
+            &show_main,
+            &quick_note,
+            &close_to_tray,
+            &autostart,
+            &separator,
+            &quit,
+        ],
+    )?;
+
+    TrayIconBuilder::new()
+        .icon(
+            app.default_window_icon()
+                .expect("missing default window icon")
+                .clone(),
+        )
+        .tooltip("花笺")
+        .menu(&menu)
+        .show_menu_on_left_click(false)
+        .on_menu_event(|app, event| {
+            if let Err(error) = handle_tray_menu_event(app, event.id.as_ref()) {
+                eprintln!("failed to handle tray menu event {:?}: {error}", event.id);
+            }
+        })
+        .on_tray_icon_event(|tray, event| {
+            if let TrayIconEvent::Click {
+                button: MouseButton::Left,
+                button_state: MouseButtonState::Up,
+                ..
+            } = event
+            {
+                if let Err(error) = show_main_window(tray.app_handle()) {
+                    eprintln!("failed to show main window from tray: {error}");
+                }
+            }
+        })
+        .build(app)?;
+
+    Ok(())
+}
+
+fn handle_tray_menu_event(app: &AppHandle, id: &str) -> Result<(), Box<dyn Error>> {
+    match tray_menu_action(id) {
+        Some(TrayMenuAction::ShowMain) => show_main_window(app)?,
+        Some(TrayMenuAction::QuickNote) => {
+            open_notepad_window_now(app, None, None)?;
+        }
+        Some(TrayMenuAction::ToggleCloseToTray) => {
+            let store = default_store()?;
+            let mut config = store.load_config()?;
+            config.close_to_tray = !config.close_to_tray;
+            store.save_config(config)?;
+        }
+        Some(TrayMenuAction::ToggleAutostart) => toggle_autostart(app)?,
+        Some(TrayMenuAction::Quit) => {
+            mark_app_exiting(app);
+            app.exit(0);
+        }
+        None => {}
+    }
+
+    Ok(())
+}
+
+fn show_main_window(app: &AppHandle) -> Result<(), AppError> {
+    if let Some(window) = app.get_webview_window(MAIN_WINDOW_LABEL) {
+        window.unminimize()?;
+        window.show()?;
+        window.set_focus()?;
+        return Ok(());
+    }
+
+    open_or_focus_window(
+        app,
+        MAIN_WINDOW_LABEL,
+        "index.html".to_string(),
+        "花笺",
+        1180.0,
+        760.0,
+        900.0,
+        620.0,
+        false,
+        false,
+        true,
+        None,
+    )?;
+    Ok(())
+}
+
+fn open_notepad_window_now(
+    app: &AppHandle,
+    note_id: Option<&str>,
+    bounds: Option<WindowBounds>,
+) -> Result<String, AppError> {
+    if note_id.is_none() {
+        if let Some(reused) = activate_pooled_notepad(app, bounds) {
+            return Ok(reused);
+        }
+    }
+
+    let label = notepad_window_label(note_id);
+    let specs = notepad_window_specs();
+    let url = match note_id {
+        Some(id) => format!("index.html?view=notepad&noteId={id}"),
+        None => "index.html?view=notepad".to_string(),
+    };
+
+    open_or_focus_window(
+        app,
+        &label,
+        url,
+        "花笺便签",
+        specs.width,
+        specs.height,
+        specs.min_width,
+        specs.min_height,
+        false,
+        true,
+        false,
+        bounds,
+    )
+}
+
+fn activate_pooled_notepad(
+    app: &AppHandle,
+    bounds: Option<WindowBounds>,
+) -> Option<String> {
+    let pool = app.try_state::<NotepadPool>()?;
+    let label = pool.take()?;
+    let window = app.get_webview_window(&label)?;
+
+    let specs = notepad_window_specs();
+    let _ = window.set_size(tauri::LogicalSize::new(specs.width, specs.height));
+    let _ = apply_window_bounds(&window, bounds);
+    let _ = window.show();
+    let _ = window.set_focus();
+    let _ = window.emit("notepad:activate", label.clone());
+
+    schedule_notepad_replenish(app, 100);
+
+    Some(label)
+}
+
+pub fn recycle_notepad_window(app: &AppHandle, label: &str) -> Result<(), AppError> {
+    let Some(window) = app.get_webview_window(label) else {
+        return Ok(());
+    };
+
+    window.hide()?;
+
+    let recycled = app
+        .try_state::<NotepadPool>()
+        .map(|pool| pool.put(label.to_string()))
+        .unwrap_or(false);
+
+    if !recycled {
+        window.close()?;
+    }
+
+    Ok(())
+}
+
+fn schedule_notepad_prewarm(app: &AppHandle) {
+    for i in 0..NOTEPAD_POOL_CAPACITY {
+        let delay = 800 + i as u64 * 400;
+        schedule_notepad_replenish(app, delay);
+    }
+}
+
+fn schedule_notepad_replenish(app: &AppHandle, delay_ms: u64) {
+    let handle = app.clone();
+    std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+        let handle_inner = handle.clone();
+        let _ = handle.run_on_main_thread(move || {
+            if let Err(error) = prewarm_notepad(&handle_inner) {
+                eprintln!("failed to replenish notepad pool: {error}");
+            }
+        });
+    });
+}
+
+fn prewarm_notepad(app: &AppHandle) -> Result<(), AppError> {
+    let pool = app
+        .try_state::<NotepadPool>()
+        .ok_or_else(|| AppError {
+            code: "noPool".into(),
+            message: "notepad pool not initialized".into(),
+        })?;
+
+    if !pool.is_below_capacity() {
+        return Ok(());
+    }
+
+    let label = notepad_window_label(None);
+    let specs = notepad_window_specs();
+    let visual_options = dynamic_window_visual_options(&label);
+
+    WebviewWindowBuilder::new(
+        app,
+        &label,
+        WebviewUrl::App("index.html?view=notepad&standby=1".into()),
+    )
+    .title("花笺便签")
+    .inner_size(specs.width, specs.height)
+    .min_inner_size(specs.min_width, specs.min_height)
+    .resizable(true)
+    .decorations(false)
+    .transparent(visual_options.transparent)
+    .always_on_top(true)
+    .shadow(false)
+    .visible(false)
+    .focused(false)
+    .build()?;
+
+    pool.put(label);
+
+    Ok(())
+}
+
+fn notepad_window_specs() -> WindowSizeSpec {
+    WindowSizeSpec {
+        width: 260.0,
+        height: 260.0,
+        min_width: 220.0,
+        min_height: 220.0,
+    }
+}
+
+fn open_tile_window_now(
+    app: &AppHandle,
+    note_id: &str,
+    bounds: Option<WindowBounds>,
+) -> Result<String, AppError> {
+    let label = tile_window_label(note_id);
+    let url = format!("index.html?view=tile&noteId={note_id}");
+
+    let specs = notepad_window_specs();
+
+    open_or_focus_window(
+        app,
+        &label,
+        url,
+        "花笺磁贴",
+        specs.width,
+        specs.height,
+        specs.min_width,
+        specs.min_height,
+        false,
+        true,
+        false,
+        bounds,
+    )
+}
+
+fn open_or_focus_window(
+    app: &AppHandle,
+    label: &str,
+    url: String,
+    title: &str,
+    width: f64,
+    height: f64,
+    min_width: f64,
+    min_height: f64,
+    decorations: bool,
+    always_on_top: bool,
+    shadow: bool,
+    bounds: Option<WindowBounds>,
+) -> Result<String, AppError> {
+    let visual_options = dynamic_window_visual_options(label);
+
+    if let Some(window) = app.get_webview_window(label) {
+        apply_window_bounds(&window, bounds)?;
+        window.set_shadow(shadow)?;
+        window.unminimize()?;
+        window.show()?;
+        window.set_focus()?;
+        return Ok(label.to_string());
+    }
+
+    let mut builder = WebviewWindowBuilder::new(app, label, WebviewUrl::App(url.into()))
+        .title(title)
+        .inner_size(width, height)
+        .min_inner_size(min_width, min_height)
+        .resizable(true)
+        .decorations(decorations)
+        .transparent(visual_options.transparent)
+        .always_on_top(always_on_top)
+        .shadow(shadow)
+        .visible(false);
+
+    if let Some(bounds) = bounds {
+        builder = builder
+            .position(bounds.x as f64, bounds.y as f64)
+            .inner_size(bounds.width as f64, bounds.height as f64);
+    }
+
+    builder.build()?;
+
+    Ok(label.to_string())
+}
+
+fn apply_window_bounds(
+    window: &tauri::WebviewWindow,
+    bounds: Option<WindowBounds>,
+) -> Result<(), AppError> {
+    if let Some(bounds) = bounds {
+        window.set_position(PhysicalPosition::new(bounds.x, bounds.y))?;
+        window.set_size(PhysicalSize::new(bounds.width, bounds.height))?;
+    }
+
+    Ok(())
+}
+
+fn notepad_window_label(note_id: Option<&str>) -> String {
+    match note_id {
+        Some(id) => format!("notepad-{}", sanitize_label_part(id)),
+        None => format!("notepad-{}", Uuid::new_v4()),
+    }
+}
+
+fn tile_window_label(note_id: &str) -> String {
+    format!("tile-{}", sanitize_label_part(note_id))
+}
+
+fn dynamic_window_visual_options(label: &str) -> DynamicWindowVisualOptions {
+    let is_note_surface = label.starts_with("notepad-") || label.starts_with("tile-");
+
+    DynamicWindowVisualOptions {
+        transparent: is_note_surface,
+    }
+}
+
+fn sanitize_label_part(value: &str) -> String {
+    let sanitized: String = value
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
+                ch
+            } else {
+                '-'
+            }
+        })
+        .collect();
+
+    sanitized.trim_matches('-').to_string()
+}
+
+fn load_config() -> Result<AppConfig, AppError> {
+    default_store()?.load_config()
+}
+
+fn close_to_tray_enabled() -> bool {
+    load_config()
+        .map(|config| config.close_to_tray)
+        .unwrap_or(true)
+}
+
+fn app_is_exiting(app: &AppHandle) -> bool {
+    app.try_state::<RuntimeState>()
+        .map(|state| state.is_exiting())
+        .unwrap_or(false)
+}
+
+fn mark_app_exiting(app: &AppHandle) {
+    if let Some(state) = app.try_state::<RuntimeState>() {
+        state.allow_exit();
+    }
+}
+
+#[cfg(desktop)]
+fn setup_autostart_plugin(app: &AppHandle) -> tauri::Result<()> {
+    app.plugin(tauri_plugin_autostart::init(
+        MacosLauncher::LaunchAgent,
+        Some(vec!["--silent"]),
+    ))
+}
+
+#[cfg(not(desktop))]
+fn setup_autostart_plugin(_app: &AppHandle) -> tauri::Result<()> {
+    Ok(())
+}
+
+#[cfg(desktop)]
+fn setup_global_shortcut_plugin(app: &AppHandle) -> tauri::Result<()> {
+    app.plugin(
+        tauri_plugin_global_shortcut::Builder::new()
+            .with_handler(|app, _shortcut, event| {
+                if event.state() == ShortcutState::Pressed {
+                    let app_for_closure = app.clone();
+                    if let Err(error) = app.run_on_main_thread(move || {
+                        if let Err(error) = open_notepad_window_now(&app_for_closure, None, None) {
+                            eprintln!("failed to open notepad from global shortcut: {error}");
+                        }
+                    }) {
+                        eprintln!("failed to dispatch global shortcut action: {error}");
+                    }
+                }
+            })
+            .build(),
+    )
+}
+
+#[cfg(not(desktop))]
+fn setup_global_shortcut_plugin(_app: &AppHandle) -> tauri::Result<()> {
+    Ok(())
+}
+
+#[cfg(desktop)]
+fn register_configured_global_shortcut(app: &AppHandle) {
+    let Ok(config) = load_config() else {
+        return;
+    };
+
+    if let Err(error) = register_global_shortcut(app, &config.global_shortcut) {
+        eprintln!(
+            "failed to register global shortcut {}: {error}",
+            config.global_shortcut
+        );
+    }
+}
+
+#[cfg(not(desktop))]
+fn register_configured_global_shortcut(_app: &AppHandle) {}
+
+#[cfg(desktop)]
+fn register_global_shortcut(app: &AppHandle, shortcut_config: &str) -> Result<(), Box<dyn Error>> {
+    let Some(shortcut) = shortcut_from_config(shortcut_config).and_then(to_tauri_shortcut) else {
+        return Err(Box::new(AppError {
+            code: "unsupportedShortcut".into(),
+            message: format!("unsupported global shortcut config: {shortcut_config}"),
+        }));
+    };
+
+    app.global_shortcut().register(shortcut)?;
+    Ok(())
+}
+
+#[cfg(not(desktop))]
+fn register_global_shortcut(
+    _app: &AppHandle,
+    _shortcut_config: &str,
+) -> Result<(), Box<dyn Error>> {
+    Ok(())
+}
+
+#[cfg(desktop)]
+fn apply_global_shortcut_config(
+    app: &AppHandle,
+    shortcut_config: &str,
+) -> Result<(), Box<dyn Error>> {
+    let Some(shortcut) = shortcut_from_config(shortcut_config).and_then(to_tauri_shortcut) else {
+        return Err(Box::new(AppError {
+            code: "unsupportedShortcut".into(),
+            message: format!("unsupported global shortcut config: {shortcut_config}"),
+        }));
+    };
+
+    app.global_shortcut().unregister_all()?;
+    app.global_shortcut().register(shortcut)?;
+    Ok(())
+}
+
+#[cfg(not(desktop))]
+fn apply_global_shortcut_config(
+    _app: &AppHandle,
+    _shortcut_config: &str,
+) -> Result<(), Box<dyn Error>> {
+    Ok(())
+}
+
+#[cfg(desktop)]
+fn to_tauri_shortcut(spec: ShortcutSpec) -> Option<Shortcut> {
+    let modifier = match spec.modifier {
+        ShortcutModifier::Control => Modifiers::CONTROL,
+        ShortcutModifier::Alt => Modifiers::ALT,
+    };
+    let key = match spec.key {
+        ShortcutKey::Space => Code::Space,
+    };
+
+    Some(Shortcut::new(Some(modifier), key))
+}
+
+#[cfg(desktop)]
+fn sync_autostart_to_config(app: &AppHandle) {
+    let Ok(config) = load_config() else {
+        return;
+    };
+
+    if let Err(error) = apply_autostart(app, config.autostart) {
+        eprintln!("failed to sync autostart config: {error}");
+    }
+}
+
+#[cfg(not(desktop))]
+fn sync_autostart_to_config(_app: &AppHandle) {}
+
+#[cfg(desktop)]
+fn autostart_enabled(app: &AppHandle, fallback: bool) -> bool {
+    app.autolaunch().is_enabled().unwrap_or(fallback)
+}
+
+#[cfg(not(desktop))]
+fn autostart_enabled(_app: &AppHandle, fallback: bool) -> bool {
+    fallback
+}
+
+fn toggle_autostart(app: &AppHandle) -> Result<(), Box<dyn Error>> {
+    let store = default_store()?;
+    let mut config = store.load_config()?;
+    let next_enabled = !config.autostart;
+    apply_autostart(app, next_enabled)?;
+    config.autostart = next_enabled;
+    store.save_config(config)?;
+    Ok(())
+}
+
+#[cfg(desktop)]
+fn apply_autostart(app: &AppHandle, enabled: bool) -> Result<(), Box<dyn Error>> {
+    let manager = app.autolaunch();
+    if enabled {
+        manager.enable()?;
+    } else {
+        manager.disable()?;
+    }
+    Ok(())
+}
+
+#[cfg(not(desktop))]
+fn apply_autostart(_app: &AppHandle, _enabled: bool) -> Result<(), Box<dyn Error>> {
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn maps_tray_menu_ids_to_actions() {
+        assert_eq!(
+            tray_menu_action("show-main"),
+            Some(TrayMenuAction::ShowMain)
+        );
+        assert_eq!(
+            tray_menu_action("quick-note"),
+            Some(TrayMenuAction::QuickNote)
+        );
+        assert_eq!(
+            tray_menu_action("toggle-close-to-tray"),
+            Some(TrayMenuAction::ToggleCloseToTray)
+        );
+        assert_eq!(
+            tray_menu_action("toggle-autostart"),
+            Some(TrayMenuAction::ToggleAutostart)
+        );
+        assert_eq!(tray_menu_action("quit"), Some(TrayMenuAction::Quit));
+        assert_eq!(tray_menu_action("unknown"), None);
+    }
+
+    #[test]
+    fn builds_tray_menu_specs_with_configured_checked_state() {
+        let specs = tray_menu_specs(true, false);
+        let ids: Vec<_> = specs.iter().map(|spec| spec.id).collect();
+
+        assert_eq!(
+            ids,
+            vec![
+                "show-main",
+                "quick-note",
+                "toggle-close-to-tray",
+                "toggle-autostart",
+                "quit"
+            ]
+        );
+        assert_eq!(specs[2].checked, Some(true));
+        assert_eq!(specs[3].checked, Some(false));
+    }
+
+    #[test]
+    fn parses_supported_shortcut_config_values() {
+        assert_eq!(
+            shortcut_from_config("Ctrl+Space"),
+            Some(ShortcutSpec {
+                modifier: ShortcutModifier::Control,
+                key: ShortcutKey::Space,
+            })
+        );
+        assert_eq!(
+            shortcut_from_config("CommandOrControl + Space"),
+            Some(ShortcutSpec {
+                modifier: ShortcutModifier::Control,
+                key: ShortcutKey::Space,
+            })
+        );
+        assert_eq!(
+            shortcut_from_config("Alt+Space"),
+            Some(ShortcutSpec {
+                modifier: ShortcutModifier::Alt,
+                key: ShortcutKey::Space,
+            })
+        );
+    }
+
+    #[test]
+    fn rejects_unsupported_shortcut_config_values() {
+        assert_eq!(shortcut_from_config(""), None);
+        assert_eq!(shortcut_from_config("Ctrl+Shift+Space"), None);
+        assert_eq!(shortcut_from_config("Ctrl+K"), None);
+    }
+
+    #[test]
+    fn detects_runtime_config_changes() {
+        let previous = AppConfig {
+            notes_dir: "D:\\notes".into(),
+            global_shortcut: "Ctrl+Space".into(),
+            close_to_tray: true,
+            autostart: false,
+            default_view_mode: "split".into(),
+            note_auto_save: true,
+            note_surface_auto_save: true,
+            tile_color: "#f6f3ec".into(),
+            tile_color_mode: "system".into(),
+            theme: "light".into(),
+            font_size: 14,
+            surface_font_size: 14,
+        };
+        let next = AppConfig {
+            notes_dir: "D:\\other-notes".into(),
+            global_shortcut: "Alt+Space".into(),
+            close_to_tray: false,
+            autostart: true,
+            default_view_mode: "preview".into(),
+            note_auto_save: false,
+            note_surface_auto_save: false,
+            tile_color: "#efe8dc".into(),
+            tile_color_mode: "custom".into(),
+            theme: "dark".into(),
+            font_size: 16,
+            surface_font_size: 16,
+        };
+
+        assert_eq!(
+            runtime_config_changes(&previous, &next),
+            RuntimeConfigChanges {
+                autostart_changed: true,
+                global_shortcut_changed: true,
+            }
+        );
+        assert_eq!(
+            runtime_config_changes(&previous, &previous),
+            RuntimeConfigChanges {
+                autostart_changed: false,
+                global_shortcut_changed: false,
+            }
+        );
+    }
+
+    #[test]
+    fn builds_stable_dynamic_window_labels() {
+        assert_eq!(notepad_window_label(Some("abc-123")), "notepad-abc-123");
+        assert!(notepad_window_label(None).starts_with("notepad-"));
+        assert_eq!(tile_window_label("note-1"), "tile-note-1");
+    }
+
+    #[test]
+    fn keeps_notepad_initial_window_compact() {
+        let specs = notepad_window_specs();
+
+        assert_eq!(specs.width, 260.0);
+        assert_eq!(specs.height, 260.0);
+        assert_eq!(specs.min_width, 220.0);
+        assert_eq!(specs.min_height, 220.0);
+    }
+
+    #[test]
+    fn makes_note_surfaces_transparent() {
+        assert_eq!(
+            dynamic_window_visual_options("notepad-note-1"),
+            DynamicWindowVisualOptions { transparent: true }
+        );
+        assert_eq!(
+            dynamic_window_visual_options("tile-note-1"),
+            DynamicWindowVisualOptions { transparent: true }
+        );
+        assert_eq!(
+            dynamic_window_visual_options("main"),
+            DynamicWindowVisualOptions {
+                transparent: false,
+            }
+        );
+    }
+
+    #[test]
+    fn capability_allows_frontend_window_focus_for_notepad_surfaces() {
+        let capability: serde_json::Value =
+            serde_json::from_str(include_str!("../capabilities/default.json"))
+                .expect("default capability should be valid json");
+        let windows = capability["windows"]
+            .as_array()
+            .expect("capability should define windows");
+        let permissions = capability["permissions"]
+            .as_array()
+            .expect("capability should define permissions");
+
+        assert!(windows
+            .iter()
+            .any(|window| window.as_str() == Some("notepad-*")));
+        assert!(permissions
+            .iter()
+            .any(|permission| permission.as_str() == Some("core:window:allow-set-focus")));
+    }
+}

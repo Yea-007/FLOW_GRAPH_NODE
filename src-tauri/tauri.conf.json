@@ -1,0 +1,48 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "花笺",
+  "version": "1.0.3",
+  "identifier": "com.floral-notepaper.app",
+  "build": {
+    "beforeDevCommand": "npm.cmd run dev",
+    "devUrl": "http://localhost:1420",
+    "beforeBuildCommand": "npm.cmd run build",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "label": "main",
+        "title": "花笺",
+        "width": 1180,
+        "height": 760,
+        "minWidth": 900,
+        "minHeight": 620,
+        "decorations": false,
+        "visible": false
+      }
+    ],
+    "security": {
+      "csp": null
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": "nsis",
+    "windows": {
+      "nsis": {
+        "installMode": "both",
+        "languages": ["SimpChinese"],
+        "displayLanguageSelector": false,
+        "installerHooks": "nsis-hooks.nsh"
+      }
+    },
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ]
+  }
+}

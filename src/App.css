@@ -1,0 +1,266 @@
+@import "tailwindcss";
+@import "katex/dist/katex.min.css";
+
+@theme {
+  --color-paper: #f6f3ec;
+  --color-paper-warm: #f0ebe0;
+  --color-paper-deep: #e8e1d3;
+  --color-ink: #1a1a18;
+  --color-ink-soft: #3d3d38;
+  --color-ink-faint: #66665f;
+  --color-ink-ghost: #76766e;
+  --color-bamboo: #2d5a3d;
+  --color-bamboo-light: #3a7a52;
+  --color-bamboo-mist: #e8f0eb;
+  --color-bamboo-glow: #d4e8da;
+  --color-stone: #6b6b62;
+  --color-cloud: #ffffff;
+  --color-shadow: rgba(26, 26, 24, 0.06);
+  --color-shadow-deep: rgba(26, 26, 24, 0.12);
+  --color-danger-bg: #fef2f2;
+
+  --font-display: "Noto Serif SC", "Source Han Serif SC", Georgia, serif;
+  --font-body: "Noto Sans SC", "Source Han Sans SC", system-ui, sans-serif;
+  --font-mono: "JetBrains Mono", "Fira Code", monospace;
+}
+
+:root[data-theme="dark"] {
+  --color-paper: #222120;
+  --color-paper-warm: #2c2a27;
+  --color-paper-deep: #3c3935;
+  --color-ink: #e5e1da;
+  --color-ink-soft: #d1cdc5;
+  --color-ink-faint: #b8b4ac;
+  --color-ink-ghost: #a39f97;
+  --color-bamboo: #4faa70;
+  --color-bamboo-light: #5fc085;
+  --color-bamboo-mist: #1c2e22;
+  --color-bamboo-glow: #243a2c;
+  --color-stone: #8a8880;
+  --color-cloud: #1a1917;
+  --color-shadow: rgba(0, 0, 0, 0.3);
+  --color-shadow-deep: rgba(0, 0, 0, 0.5);
+  --color-danger-bg: rgba(220, 38, 38, 0.15);
+}
+
+/* Theme transition — applied briefly during theme switch for a uniform crossfade */
+html.theme-transition,
+html.theme-transition *,
+html.theme-transition *::before,
+html.theme-transition *::after {
+  transition: color 0.35s ease, background-color 0.35s ease, border-color 0.35s ease, box-shadow 0.35s ease, fill 0.35s ease, stroke 0.35s ease !important;
+  transition-delay: 0s !important;
+}
+html.theme-transition .sliding-highlight {
+  transition: left 0.25s cubic-bezier(0.22,1,0.36,1), top 0.25s cubic-bezier(0.22,1,0.36,1), width 0.25s cubic-bezier(0.22,1,0.36,1), height 0.25s cubic-bezier(0.22,1,0.36,1), background-color 0.35s ease, box-shadow 0.35s ease !important;
+}
+
+/* Global resets */
+*, *::before, *::after {
+  box-sizing: border-box;
+}
+
+html {
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+::-webkit-scrollbar { width: 4px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: var(--color-ink-ghost); border-radius: 2px; }
+::-webkit-scrollbar-thumb:hover { background: var(--color-ink-faint); }
+
+.scrollbar-hidden::-webkit-scrollbar { display: none; }
+.scrollbar-hidden { -ms-overflow-style: none; scrollbar-width: none; }
+
+textarea, input {
+  resize: none;
+  outline: none;
+  border: none;
+  background: transparent;
+}
+textarea::placeholder, input::placeholder {
+  color: var(--color-ink-ghost);
+}
+
+/* Noise texture overlay for paper feel */
+.noise-bg {
+  position: relative;
+  isolation: isolate;
+}
+.noise-bg::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  opacity: 0.025;
+  background-image: url("data:image/svg+xml,%3Csvg viewBox='0 0 256 256' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.85' numOctaves='4' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E");
+  background-size: 200px 200px;
+  pointer-events: none;
+  border-radius: inherit;
+  z-index: -1;
+}
+
+/* Animations */
+@keyframes fade-up {
+  from { opacity: 0; transform: translateY(14px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+@keyframes scale-in {
+  from { opacity: 0; transform: scale(0.95); }
+  to { opacity: 1; transform: scale(1); }
+}
+@keyframes shimmer {
+  0%, 100% { opacity: 0.4; }
+  50% { opacity: 0.7; }
+}
+@keyframes float-gentle {
+  0%, 100% { transform: translateY(0) rotate(0deg); }
+  50% { transform: translateY(-6px) rotate(0.3deg); }
+}
+@keyframes dash-draw {
+  to { stroke-dashoffset: 0; }
+}
+@keyframes window-enter {
+  from { opacity: 0; transform: scale(0.96); }
+  to { opacity: 1; transform: scale(1); }
+}
+@keyframes window-exit {
+  from { opacity: 1; transform: scale(1); }
+  to { opacity: 0; transform: scale(0.96); }
+}
+@keyframes menu-enter {
+  from { opacity: 0; transform: translateY(4px) scale(0.97); }
+  to { opacity: 1; transform: translateY(0) scale(1); }
+}
+@keyframes menu-exit {
+  from { opacity: 1; transform: translateY(0) scale(1); }
+  to { opacity: 0; transform: translateY(4px) scale(0.97); }
+}
+
+.animate-fade-up {
+  animation: fade-up 0.55s cubic-bezier(0.22, 1, 0.36, 1) forwards;
+}
+.animate-scale-in {
+  animation: scale-in 0.45s cubic-bezier(0.22, 1, 0.36, 1) forwards;
+}
+.animate-float {
+  animation: float-gentle 4s ease-in-out infinite;
+}
+.animate-window-enter {
+  animation: window-enter 0.18s cubic-bezier(0.22, 1, 0.36, 1) both;
+}
+.animate-window-exit {
+  animation: window-exit 0.12s cubic-bezier(0.22, 1, 0.36, 1) forwards;
+  pointer-events: none;
+}
+.animate-menu-enter {
+  animation: menu-enter 0.2s cubic-bezier(0.22, 1, 0.36, 1) forwards;
+}
+.animate-menu-exit {
+  animation: menu-exit 0.15s cubic-bezier(0.22, 1, 0.36, 1) forwards;
+  pointer-events: none;
+}
+@keyframes fade-in {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+.animate-fade-in {
+  animation: fade-in 0.25s ease-out forwards;
+}
+@keyframes note-enter {
+  from { opacity: 0; transform: translateY(6px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+.animate-note-enter {
+  animation: note-enter 0.6s cubic-bezier(0.22, 1, 0.36, 1) forwards;
+}
+@keyframes view-fade {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+.animate-view-fade {
+  animation: view-fade 0.72s ease-out forwards;
+}
+
+/* Delete confirm inline pop */
+@keyframes delete-confirm-enter {
+  from { opacity: 0; transform: scale(0.9); }
+  to { opacity: 1; transform: scale(1); }
+}
+@keyframes delete-confirm-exit {
+  from { opacity: 1; transform: scale(1); }
+  to { opacity: 0; transform: scale(0.9); }
+}
+.animate-delete-confirm {
+  animation: delete-confirm-enter 0.18s cubic-bezier(0.22, 1, 0.36, 1) forwards;
+}
+.animate-delete-confirm-exit {
+  animation: delete-confirm-exit 0.15s cubic-bezier(0.22, 1, 0.36, 1) forwards;
+  pointer-events: none;
+}
+
+/* Save status crossfade */
+@keyframes status-fade {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+.animate-status-fade {
+  animation: status-fade 0.25s ease-out forwards;
+}
+
+/* Resize handle */
+.resize-handle {
+  width: 5px;
+  cursor: col-resize;
+  flex-shrink: 0;
+  position: relative;
+  background: transparent;
+  transition: background-color 0.15s ease;
+  user-select: none;
+}
+.resize-handle::after {
+  content: "";
+  position: absolute;
+  left: 2px;
+  top: 0;
+  bottom: 0;
+  width: 1px;
+  background: var(--color-paper-deep);
+  opacity: 0.4;
+}
+.resize-handle:hover,
+.resize-handle:active {
+  background: var(--color-bamboo-mist);
+}
+.resize-handle:active::after {
+  background: var(--color-bamboo);
+  opacity: 0.6;
+}
+
+.format-select { max-width: 92px; height: 28px; padding: 0 4px; border: 1px solid var(--color-paper-deep); border-radius: 4px; background: var(--color-cloud); color: var(--color-ink); font-size: 12px; cursor: pointer; }
+.format-select:focus-visible { outline: 2px solid var(--color-bamboo); }
+
+:root { --format-red: #b52c2c; --format-orange: #a75000; --format-green: #08723a; --format-blue: #2458ba; --format-purple: #773bb0; }
+:root[data-theme="dark"] { --format-red: #ff9292; --format-orange: #ffbd79; --format-green: #86d9a4; --format-blue: #9bbcff; --format-purple: #d2abff; }
+
+[data-text-color="red"] { color: var(--format-red); }
+[data-text-color="orange"] { color: var(--format-orange); }
+[data-text-color="green"] { color: var(--format-green); }
+[data-text-color="blue"] { color: var(--format-blue); }
+[data-text-color="purple"] { color: var(--format-purple); }
+[data-text-background] { color: #252525; border-radius: 2px; }
+[data-text-background="yellow"] { background: #fff29d; }
+[data-text-background="pink"] { background: #ffd3d8; }
+[data-text-background="green"] { background: #c5efca; }
+[data-text-background="blue"] { background: #cedeff; }
+[data-text-background="purple"] { background: #e2d0ff; }
+[data-text-size="12"] { font-size: 12px; }
+[data-text-size="16"] { font-size: 16px; }
+[data-text-size="20"] { font-size: 20px; }
+[data-text-size="24"] { font-size: 24px; }
+
+[data-text-background][data-text-color="red"] { color: #a32626; }
+[data-text-background][data-text-color="orange"] { color: #914600; }
+[data-text-background][data-text-color="green"] { color: #086334; }
+[data-text-background][data-text-color="blue"] { color: #204da0; }
+[data-text-background][data-text-color="purple"] { color: #653298; }

@@ -1,0 +1,59 @@
+import { invoke } from "@tauri-apps/api/core";
+import type { StyleRange } from "../markdown/styleRanges";
+import type { Note, NoteMetadata, NoteReorderEntry, SaveNoteRequest } from "./types";
+
+export function listNotes(): Promise<NoteMetadata[]> {
+  return invoke("notes_list");
+}
+
+export async function getNote(id: string): Promise<Note> {
+  const [note, styleDocument] = await Promise.all([invoke<Note>("notes_get", { id }), getNoteStyles(id)]);
+  return { ...note, styleDocument };
+}
+
+export function createNote(request: SaveNoteRequest): Promise<Note> {
+  return invoke("notes_create", { request });
+}
+
+export function updateNote(id: string, request: SaveNoteRequest): Promise<Note> {
+  return invoke("notes_update", { id, request });
+}
+
+export function deleteNote(id: string): Promise<void> {
+  return invoke("notes_delete", { id });
+}
+
+export function readFileBase64(path: string): Promise<string> {
+  return invoke("read_file", { path });
+}
+
+export function moveNote(
+  id: string,
+  parentId: string | null,
+  sortOrder: number,
+): Promise<void> {
+  return invoke("notes_move", { id, parentId, sortOrder });
+}
+
+export function reorderNotes(orders: NoteReorderEntry[]): Promise<void> {
+  return invoke("notes_reorder", { orders });
+}
+
+export function getErrorMessage(error: unknown): string {
+  if (typeof error === "string") return error;
+  if (error && typeof error === "object" && "message" in error) {
+    return String((error as { message: unknown }).message);
+  }
+  return "操作失败";
+}
+
+/** The content snapshot lets callers detect a stale sidecar without dropping it. */
+export interface NoteStyleDocument { content: string; ranges: StyleRange[] }
+
+export function getNoteStyles(id: string): Promise<NoteStyleDocument | null> {
+  return invoke("notes_get_styles", { id });
+}
+
+export function saveNoteStyles(id: string, document: NoteStyleDocument): Promise<void> {
+  return invoke("notes_save_styles", { id, document });
+}
