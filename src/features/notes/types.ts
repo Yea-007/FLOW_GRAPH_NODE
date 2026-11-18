@@ -1,3 +1,7 @@
+export type NoteIcon = { type: "emoji" | "image"; value: string };
+
+export type NoteDropPosition = "before" | "after" | "inside";
+
 export interface NoteMetadata {
   id: string;
   title: string;
@@ -8,6 +12,7 @@ export interface NoteMetadata {
   preview: string;
   parentId: string | null;
   sortOrder: number;
+  icon?: NoteIcon | null;
 }
 
 export interface Note extends Omit<NoteMetadata, "preview"> {

@@ -23,14 +23,16 @@ import {
   getNote,
   listNotes,
   moveNote,
+  setNoteIcon,
   updateNote,
   saveNoteStyles,
 } from "../features/notes/api";
-import type { Note, NoteMetadata } from "../features/notes/types";
+import type { Note, NoteDropPosition, NoteIcon, NoteMetadata } from "../features/notes/types";
 import {
   buildNoteTree,
   countNoteChars,
   filterNotes,
+  getDisplayTitle,
   formatShortDate,
   formatTime,
   metadataFromNote,
@@ -40,6 +42,7 @@ import {
   type NoteContextMenuAction,
 } from "../features/notes/noteContextMenu";
 import { NoteTree } from "../features/notes/NoteTree";
+import { NoteIconPicker, type NoteIconAnchor } from "../features/notes/NoteIconPicker";
 import { ResizeHandle } from "./ResizeHandle";
 import { openNotepadWindow, openTileWindow } from "../features/windows/api";
 import {
@@ -269,6 +272,7 @@ export function MainWindow({
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [noteMenu, setNoteMenu] = useState<NoteMenuState | null>(null);
   const [noteMenuClosing, setNoteMenuClosing] = useState(false);
+  const [iconPicker, setIconPicker] = useState<{ noteId: string; anchor: NoteIconAnchor } | null>(null);
   const [settingsOpen, setSettingsOpen] = useState(initialSettingsOpen);
   const [settingsConfig, setSettingsConfig] = useState<AppConfig | null>(
     initialConfig ?? null,
@@ -331,6 +335,7 @@ export function MainWindow({
     () => notes.find((note) => note.id === noteMenu?.noteId) ?? null,
     [noteMenu?.noteId, notes],
   );
+  const iconPickerTarget = notes.find((note) => note.id === iconPicker?.noteId);
 
   const filteredNotes = useMemo(
     () => filterNotes(notes, searchQuery),
@@ -369,11 +374,13 @@ export function MainWindow({
 
   const replaceNoteMetadata = useCallback((note: Note) => {
     const metadata = metadataFromNote(note);
+    const { icon, parentId, sortOrder, ...contentMetadata } = metadata;
     setNotes((current) => {
       const exists = current.some((item) => item.id === metadata.id);
+      // A content save may finish after a sidebar move or icon change.
       const next = exists
-        ? current.map((item) => (item.id === metadata.id ? metadata : item))
-        : [metadata, ...current];
+        ? current.map((item) => (item.id === metadata.id ? { ...item, ...contentMetadata } : item))
+        : [{ ...contentMetadata, icon, parentId, sortOrder }, ...current];
       return [...next].sort((left, right) =>
         right.updatedAt.localeCompare(left.updatedAt),
       );
@@ -668,18 +675,23 @@ export function MainWindow({
     }
   };
 
-  const handleMoveNote = async (
+  const handleMoveNote = useCallback(async (
     noteId: string,
-    newParentId: string | null,
-    newSortOrder: number,
+    targetId: string,
+    position: NoteDropPosition,
   ) => {
     setErrorMessage(null);
     try {
-      await moveNote(noteId, newParentId, newSortOrder);
+      await moveNote(noteId, targetId, position);
       await refreshNotes();
     } catch (error) {
       setErrorMessage(getErrorMessage(error));
     }
+  }, [refreshNotes]);
+
+  const handleSaveNoteIcon = async (noteId: string, icon: NoteIcon | null) => {
+    await setNoteIcon(noteId, icon);
+    setNotes((current) => current.map((note) => (note.id === noteId ? { ...note, icon } : note)));
   };
 
   const handleOpenNoteMenu = (
@@ -690,7 +702,7 @@ export function MainWindow({
     event.stopPropagation();
 
     const menuWidth = 168;
-    const menuHeight = 112;
+    const menuHeight = noteContextMenuItems.length * 30 + 20;
     const x = Math.min(event.clientX, window.innerWidth - menuWidth - 4);
     const y = Math.min(event.clientY, window.innerHeight - menuHeight - 4);
 
@@ -727,6 +739,12 @@ export function MainWindow({
 
     if (action === "newChild") {
       void handleCreateChildNote(note.id);
+      return;
+    }
+
+    if (action === "changeIcon" && noteMenu) {
+      const { x, y } = noteMenu;
+      setIconPicker({ noteId: note.id, anchor: { left: x, top: y, bottom: y } });
       return;
     }
 
@@ -1028,16 +1046,13 @@ export function MainWindow({
             {!isLoading && filteredNotes.length > 0 ? (
               <NoteTree
                 notes={noteTree}
+                allNotes={notes}
                 selectedId={selectedId}
                 hoveredId={hoveredId}
                 onSelectNote={(id) => void handleSelectNote(id)}
                 onHoverNote={setHoveredId}
-                onContextMenu={(event, noteId) =>
-                  handleOpenNoteMenu(
-                    event as unknown as MouseEvent<HTMLElement>,
-                    noteId,
-                  )
-                }
+                onContextMenu={handleOpenNoteMenu}
+                onChangeIcon={(noteId, button) => setIconPicker({ noteId, anchor: button.getBoundingClientRect() })}
                 onCreateChild={handleCreateChildNote}
                 onMoveNote={handleMoveNote}
               />
@@ -1365,6 +1380,16 @@ export function MainWindow({
             </button>
           ))}
         </div>
+      )}
+      {iconPicker && iconPickerTarget && (
+        <NoteIconPicker
+          key={iconPicker.noteId}
+          anchor={iconPicker.anchor}
+          title={getDisplayTitle(iconPickerTarget)}
+          icon={iconPickerTarget.icon}
+          onClose={() => setIconPicker((current) => current === iconPicker ? null : current)}
+          onSave={(icon) => handleSaveNoteIcon(iconPicker.noteId, icon)}
+        />
       )}
     </div>
   );

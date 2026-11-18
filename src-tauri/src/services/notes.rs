@@ -2,6 +2,7 @@ use base64::Engine;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::{
+    collections::HashSet,
     env, fmt, fs, io,
     path::{Path, PathBuf},
 };
@@ -54,6 +55,8 @@ pub struct NoteMetadata {
     pub parent_id: Option<String>,
     #[serde(default = "default_sort_order")]
     pub sort_order: i32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub icon: Option<NoteIcon>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -70,6 +73,45 @@ pub struct Note {
     pub parent_id: Option<String>,
     #[serde(default = "default_sort_order")]
     pub sort_order: i32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub icon: Option<NoteIcon>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "type", content = "value", rename_all = "camelCase")]
+pub enum NoteIcon {
+    Emoji(String),
+    Image(String),
+}
+
+impl NoteIcon {
+    fn is_valid(&self) -> bool {
+        match self {
+            Self::Emoji(value) => {
+                !value.is_empty()
+                    && value.len() <= 128
+                    && !value.chars().any(|ch| ch.is_whitespace() || ch.is_control())
+            }
+            Self::Image(value) => {
+                if value.len() > 16_384 {
+                    return false;
+                }
+                let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(value) else {
+                    return false;
+                };
+                // The picker renders uploads onto a 48×48 canvas before saving them.
+                bytes.get(..24) == Some(b"\x89PNG\r\n\x1a\n\0\0\0\x0dIHDR\0\0\0\x30\0\0\0\x30")
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum NoteDropPosition {
+    Before,
+    After,
+    Inside,
 }
 
 /// Formatting is stored separately from the Markdown document. Offsets use UTF-16.
@@ -235,6 +277,7 @@ impl NoteStore {
             content,
             parent_id: metadata.parent_id,
             sort_order: metadata.sort_order,
+            icon: metadata.icon,
         })
     }
 
@@ -256,6 +299,7 @@ impl NoteStore {
             preview: preview(&request.content),
             parent_id: parent_id.clone(),
             sort_order,
+            icon: None,
         };
 
         fs::write(self.note_path(&file_name), &request.content)?;
@@ -273,6 +317,7 @@ impl NoteStore {
             content: request.content,
             parent_id,
             sort_order,
+            icon: None,
         })
     }
 
@@ -314,10 +359,25 @@ impl NoteStore {
             content: request.content,
             parent_id: note.parent_id.clone(),
             sort_order: note.sort_order,
+            icon: note.icon.clone(),
         };
 
         self.save_metadata(&metadata_file)?;
         Ok(result)
+    }
+
+    pub fn set_note_icon(&self, id: &str, icon: Option<NoteIcon>) -> Result<(), AppError> {
+        if icon.as_ref().is_some_and(|icon| !icon.is_valid()) {
+            return Err(AppError::new("invalidNoteIcon", "笔记图标无效"));
+        }
+        let mut metadata = self.load_metadata()?;
+        let note = metadata
+            .notes
+            .iter_mut()
+            .find(|note| note.id == id)
+            .ok_or_else(|| AppError::not_found(format!("Note {id} was not found")))?;
+        note.icon = icon;
+        self.save_metadata(&metadata)
     }
 
     fn collect_descendant_ids(notes: &[NoteMetadata], parent_id: &str) -> Vec<String> {
@@ -368,31 +428,69 @@ impl NoteStore {
     pub fn move_note(
         &self,
         id: &str,
-        new_parent_id: Option<String>,
-        new_sort_order: i32,
+        target_id: &str,
+        position: NoteDropPosition,
     ) -> Result<(), AppError> {
         self.ensure_storage()?;
-        let mut metadata_file = self.load_metadata()?;
+        let mut metadata = self.load_metadata()?;
+        let target = metadata
+            .notes
+            .iter()
+            .find(|note| note.id == target_id)
+            .ok_or_else(|| AppError::not_found(format!("Note {target_id} was not found")))?;
+        let new_parent = match position {
+            NoteDropPosition::Inside => Some(target.id.clone()),
+            _ => target.parent_id.clone(),
+        };
 
-        let target_parent = new_parent_id.as_deref().filter(|p| !p.is_empty());
-        for sibling in metadata_file.notes.iter_mut() {
-            if sibling.id != id
-                && sibling.parent_id.as_deref() == target_parent
-                && sibling.sort_order >= new_sort_order
-            {
-                sibling.sort_order += 1;
+        let mut visited = HashSet::new();
+        let mut ancestor = Some(target_id);
+        while let Some(ancestor_id) = ancestor {
+            if ancestor_id == id || !visited.insert(ancestor_id) {
+                return Err(AppError::new("invalidNoteMove", "不能将笔记移入自身或其子笔记"));
             }
+            ancestor = metadata
+                .notes
+                .iter()
+                .find(|note| note.id == ancestor_id)
+                .and_then(|note| note.parent_id.as_deref());
         }
 
-        let note = metadata_file
+        let index = metadata
             .notes
-            .iter_mut()
-            .find(|note| note.id == id)
+            .iter()
+            .position(|note| note.id == id)
             .ok_or_else(|| AppError::not_found(format!("Note {id} was not found")))?;
+        let mut siblings: Vec<usize> = metadata
+            .notes
+            .iter()
+            .enumerate()
+            .filter_map(|(i, note)| (i != index && note.parent_id == new_parent).then_some(i))
+            .collect();
+        siblings.sort_by(|&left, &right| {
+            let left = &metadata.notes[left];
+            let right = &metadata.notes[right];
+            left.sort_order
+                .cmp(&right.sort_order)
+                .then_with(|| right.updated_at.cmp(&left.updated_at))
+        });
+        let insert_at = match position {
+            NoteDropPosition::Inside => siblings.len(),
+            _ => {
+                let target_index = siblings
+                    .iter()
+                    .position(|&i| metadata.notes[i].id == target_id)
+                    .ok_or_else(|| AppError::not_found(format!("Note {target_id} was not found")))?;
+                target_index + usize::from(position == NoteDropPosition::After)
+            }
+        };
 
-        note.parent_id = target_parent.map(String::from);
-        note.sort_order = new_sort_order;
-        self.save_metadata(&metadata_file)
+        metadata.notes[index].parent_id = new_parent;
+        siblings.insert(insert_at, index);
+        for (order, i) in siblings.into_iter().enumerate() {
+            metadata.notes[i].sort_order = order as i32;
+        }
+        self.save_metadata(&metadata)
     }
 
     pub fn reorder_notes(&self, orders: Vec<NoteReorderEntry>) -> Result<(), AppError> {
@@ -606,6 +704,7 @@ impl NoteStore {
                 preview: preview(&content),
                 parent_id: None,
                 sort_order: 0,
+                icon: None,
             });
         }
 
@@ -619,9 +718,6 @@ fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> Result<(), AppErro
     }
     let temp_path = path.with_extension("json.tmp");
     fs::write(&temp_path, serde_json::to_string_pretty(value)?)?;
-    if path.exists() {
-        fs::remove_file(path)?;
-    }
     fs::rename(temp_path, path)?;
     Ok(())
 }
@@ -863,6 +959,79 @@ mod tests {
         store.delete_note(&created.id).expect("delete note");
         assert!(store.read_note(&created.id).is_err());
         assert!(store.list_notes().expect("list after delete").is_empty());
+    }
+
+    #[test]
+    fn keeps_sidebar_icons_across_content_updates_and_store_reloads() {
+        let root = test_root("note-icon");
+        let store = NoteStore::new(root.clone());
+        let note = store.create_note(SaveNoteRequest {
+            title: "原标题".into(),
+            content: "原正文".into(),
+            parent_id: None,
+        }).unwrap();
+        let icon = Some(NoteIcon::Emoji("👩🏽‍💻".into()));
+        store.set_note_icon(&note.id, icon.clone()).unwrap();
+        let with_icon = store.read_note(&note.id).unwrap();
+        assert_eq!(with_icon.icon, icon);
+        assert_eq!(with_icon.updated_at, note.updated_at);
+        assert_eq!(with_icon.content, note.content);
+
+        let reloaded = NoteStore::new(root);
+        assert_eq!(reloaded.list_notes().unwrap()[0].icon, icon);
+        let updated = reloaded.update_note(&note.id, SaveNoteRequest {
+            title: "新标题".into(),
+            content: "新正文".into(),
+            parent_id: None,
+        }).unwrap();
+        assert_eq!(updated.icon, icon);
+
+        let malformed = Some(NoteIcon::Image("bad png".into()));
+        assert_eq!(reloaded.set_note_icon(&note.id, malformed).unwrap_err().code, "invalidNoteIcon");
+        assert_eq!(reloaded.read_note(&note.id).unwrap().icon, icon);
+
+        let image = Some(NoteIcon::Image(concat!(
+            "iVBORw0KGgoAAAANSUhEUgAAADAAAAAwCAYAAABXAvmHAAAAY0lEQVR4nO3PMQ0AIBDAQFQhEOOPCIYLSYfu17XPzM8tDWhAAx",
+            "rQgAY0oAENaEADGtCABjSgAQ1oQAMa0IAGNKABDWhAAxrQgAY0oAENaEADGtCABjSgAQ1oQAMa0IAGNOC1C8bOZ2lrsraoAAAAAElFTkSuQmCC"
+        ).into()));
+        reloaded.set_note_icon(&note.id, image.clone()).unwrap();
+        assert_eq!(store.read_note(&note.id).unwrap().icon, image);
+        reloaded.set_note_icon(&note.id, None).unwrap();
+        assert_eq!(store.read_note(&note.id).unwrap().icon, None);
+    }
+
+    #[test]
+    fn moves_relative_to_the_target_with_duplicate_orders_and_nested_notes() {
+        use NoteDropPosition::{After, Before, Inside};
+
+        let store = NoteStore::new(test_root("relative-note-move"));
+        let create = |title: &str, parent_id: Option<String>| {
+            store.create_note(SaveNoteRequest {
+                title: title.into(),
+                content: String::new(),
+                parent_id,
+            }).unwrap()
+        };
+        let first = create("First", None);
+        let second = create("Second", None);
+        let third = create("Third", None);
+        let child = create("Child", Some(first.id.clone()));
+        store.reorder_notes(vec![first.id.clone(), second.id.clone()].into_iter().map(|id| {
+            NoteReorderEntry { id, sort_order: 0 }
+        }).collect()).unwrap();
+
+        store.move_note(&third.id, &second.id, After).unwrap();
+        let order = |id: &str| store.read_note(id).unwrap().sort_order;
+        assert_eq!(order(&third.id), order(&second.id) + 1);
+
+        store.move_note(&second.id, &first.id, Inside).unwrap();
+        assert_eq!(store.read_note(&second.id).unwrap().parent_id.as_deref(), Some(first.id.as_str()));
+        assert_eq!(order(&second.id), order(&child.id) + 1);
+        assert_eq!(store.move_note(&first.id, &child.id, Before).unwrap_err().code, "invalidNoteMove");
+
+        store.move_note(&child.id, &first.id, Before).unwrap();
+        assert_eq!(store.read_note(&child.id).unwrap().parent_id, None);
+        assert_eq!(order(&child.id) + 1, order(&first.id));
     }
 
     #[test]

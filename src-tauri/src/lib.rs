@@ -2,8 +2,8 @@ pub mod desktop;
 pub mod services;
 
 use services::notes::{
-    default_store, read_file_base64, AppConfig, AppError, Note, NoteMetadata, NoteReorderEntry,
-    SaveNoteRequest, StyleDocument,
+    default_store, read_file_base64, AppConfig, AppError, Note, NoteDropPosition, NoteIcon,
+    NoteMetadata, NoteReorderEntry, SaveNoteRequest, StyleDocument,
 };
 use std::path::PathBuf;
 use tauri::{AppHandle, Emitter};
@@ -34,6 +34,11 @@ fn notes_update(id: String, request: SaveNoteRequest) -> Result<Note, AppError> 
 }
 
 #[tauri::command]
+fn notes_set_icon(id: String, icon: Option<NoteIcon>) -> Result<(), AppError> {
+    default_store()?.set_note_icon(&id, icon)
+}
+
+#[tauri::command]
 fn notes_get_styles(id: String) -> Result<Option<StyleDocument>, AppError> {
     default_store()?.read_note_styles(&id)
 }
@@ -54,8 +59,8 @@ fn read_file(path: String) -> Result<String, AppError> {
 }
 
 #[tauri::command]
-fn notes_move(id: String, parent_id: Option<String>, sort_order: i32) -> Result<(), AppError> {
-    default_store()?.move_note(&id, parent_id, sort_order)
+fn notes_move(id: String, target_id: String, position: NoteDropPosition) -> Result<(), AppError> {
+    default_store()?.move_note(&id, &target_id, position)
 }
 
 #[tauri::command]
@@ -130,6 +135,7 @@ pub fn run() {
             notes_get,
             notes_create,
             notes_update,
+            notes_set_icon,
             notes_get_styles,
             notes_save_styles,
             notes_delete,

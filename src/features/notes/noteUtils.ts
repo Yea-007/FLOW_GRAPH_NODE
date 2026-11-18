@@ -33,6 +33,7 @@ export function metadataFromNote(note: Note): NoteMetadata {
     preview: buildPreview(note.content),
     parentId: note.parentId,
     sortOrder: note.sortOrder,
+    icon: note.icon,
   };
 }
 

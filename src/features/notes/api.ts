@@ -1,6 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import type { StyleRange } from "../markdown/styleRanges";
-import type { Note, NoteMetadata, NoteReorderEntry, SaveNoteRequest } from "./types";
+import type { Note, NoteDropPosition, NoteIcon, NoteMetadata, NoteReorderEntry, SaveNoteRequest } from "./types";
 
 export function listNotes(): Promise<NoteMetadata[]> {
   return invoke("notes_list");
@@ -29,10 +29,14 @@ export function readFileBase64(path: string): Promise<string> {
 
 export function moveNote(
   id: string,
-  parentId: string | null,
-  sortOrder: number,
+  targetId: string,
+  position: NoteDropPosition,
 ): Promise<void> {
-  return invoke("notes_move", { id, parentId, sortOrder });
+  return invoke("notes_move", { id, targetId, position });
+}
+
+export function setNoteIcon(id: string, icon: NoteIcon | null): Promise<void> {
+  return invoke("notes_set_icon", { id, icon });
 }
 
 export function reorderNotes(orders: NoteReorderEntry[]): Promise<void> {
