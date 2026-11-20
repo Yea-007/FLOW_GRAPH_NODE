@@ -24,13 +24,17 @@ fn notes_get(id: String) -> Result<Note, AppError> {
 }
 
 #[tauri::command]
-fn notes_create(request: SaveNoteRequest) -> Result<Note, AppError> {
-    default_store()?.create_note(request)
+fn notes_create(app: AppHandle, request: SaveNoteRequest) -> Result<Note, AppError> {
+    let note = default_store()?.create_note(request)?;
+    let _ = app.emit("notes-changed", &note.id);
+    Ok(note)
 }
 
 #[tauri::command]
-fn notes_update(id: String, request: SaveNoteRequest) -> Result<Note, AppError> {
-    default_store()?.update_note(&id, request)
+fn notes_update(app: AppHandle, id: String, request: SaveNoteRequest) -> Result<Note, AppError> {
+    let note = default_store()?.update_note(&id, request)?;
+    let _ = app.emit("notes-changed", &note.id);
+    Ok(note)
 }
 
 #[tauri::command]

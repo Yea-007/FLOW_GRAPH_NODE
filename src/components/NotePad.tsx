@@ -55,6 +55,26 @@ interface NotePadProps {
   initialTileColor?: string;
 }
 
+interface NoteDraft {
+  noteId: string | null;
+  title: string;
+  content: string;
+  revision: number;
+  savedRevision: number;
+  savedNote: Note | null;
+}
+
+function emptyDraft(): NoteDraft {
+  return {
+    noteId: null,
+    title: "",
+    content: "",
+    revision: 0,
+    savedRevision: 0,
+    savedNote: null,
+  };
+}
+
 const surfaceResizeHandles: Array<{
   direction: ResizeDirection;
   className: string;
@@ -131,6 +151,10 @@ export function NotePad({
     resolveTileColor("system", normalizeTileColor(initialTileColor)),
   );
   const [isExiting, setIsExiting] = useState(false);
+  const [isClosing, setIsClosing] = useState(false);
+  const closingRef = useRef(false);
+  const draftRef = useRef<NoteDraft>(emptyDraft());
+  const saveQueueRef = useRef<Promise<void>>(Promise.resolve());
   const contentRef = useRef<HTMLTextAreaElement>(null);
   const isStandby = useRef(
     typeof window !== "undefined" &&
@@ -145,6 +169,14 @@ export function NotePad({
   }, []);
 
   const applyNote = useCallback((note: Note) => {
+    draftRef.current = {
+      noteId: note.id,
+      title: note.title,
+      content: note.content,
+      revision: 0,
+      savedRevision: 0,
+      savedNote: note,
+    };
     setEditingNoteId(note.id);
     setTitle(note.title);
     setContent(note.content);
@@ -208,6 +240,7 @@ export function NotePad({
       tileColor?: string;
       tileColorMode?: TileColorMode;
       surfaceFontSize?: number;
+      noteSurfaceAutoSave?: boolean;
     }>("config-changed", (event) => {
       const mode = event.payload.tileColorMode ?? tileColorMode;
       const raw = event.payload.tileColor ?? tileColorRaw;
@@ -215,6 +248,9 @@ export function NotePad({
       setTileColorRaw(normalizeTileColor(raw));
       setTileColor(resolveTileColor(mode, raw));
       if (event.payload.surfaceFontSize != null) setSurfaceFontSize(event.payload.surfaceFontSize);
+      if (event.payload.noteSurfaceAutoSave != null) {
+        setNoteSurfaceAutoSave(event.payload.noteSurfaceAutoSave);
+      }
     });
     return () => {
       void unlisten.then((fn) => fn());
@@ -246,6 +282,9 @@ export function NotePad({
 
       isStandby.current = false;
       hasEnteredOnce.current = true;
+      draftRef.current = emptyDraft();
+      closingRef.current = false;
+      setIsClosing(false);
       setEditingNoteId(null);
       setTitle("");
       setContent("");
@@ -265,30 +304,49 @@ export function NotePad({
   }, [refreshNotes]);
 
   const saveNote = useCallback(async () => {
-    const request = { title, content };
-    const note = editingNoteId
-      ? await updateNote(editingNoteId, request)
-      : await createNote(request);
+    const draft = draftRef.current;
+    const revision = draft.revision;
+    const request = { title: draft.title, content: draft.content };
+    const pending = saveQueueRef.current.then(async () => {
+      if (draft.savedNote && draft.savedRevision >= revision) {
+        return draft.savedNote;
+      }
 
-    setEditingNoteId(note.id);
-    setNotes((current) => {
-      const metadata = metadataFromNote(note);
-      const exists = current.some((item) => item.id === note.id);
-      const next = exists
-        ? current.map((item) => (item.id === note.id ? metadata : item))
-        : [metadata, ...current];
-      return [...next].sort((left, right) =>
-        right.updatedAt.localeCompare(left.updatedAt),
-      );
+      const note = draft.noteId
+        ? await updateNote(draft.noteId, request)
+        : await createNote(request);
+      draft.noteId = note.id;
+      draft.savedRevision = revision;
+      draft.savedNote = note;
+
+      setNotes((current) => {
+        const metadata = metadataFromNote(note);
+        const exists = current.some((item) => item.id === note.id);
+        const next = exists
+          ? current.map((item) => (item.id === note.id ? metadata : item))
+          : [metadata, ...current];
+        return [...next].sort((left, right) =>
+          right.updatedAt.localeCompare(left.updatedAt),
+        );
+      });
+      if (draftRef.current === draft) {
+        setEditingNoteId(note.id);
+        setStatus(draft.revision === revision ? "已保存" : "未保存");
+      }
+      return note;
     });
-    setStatus("已保存");
-    return note;
-  }, [content, editingNoteId, title]);
+    // A second save must reuse the ID returned by an in-flight create.
+    saveQueueRef.current = pending.then(
+      () => undefined,
+      () => undefined,
+    );
+    return pending;
+  }, []);
 
-  const hasDraftContent = useCallback(
-    () => Boolean(editingNoteId || title.trim() || content.trim()),
-    [content, editingNoteId, title],
-  );
+  const hasDraftContent = useCallback(() => {
+    const draft = draftRef.current;
+    return Boolean(draft.noteId || draft.title.trim() || draft.content.trim());
+  }, []);
 
   const switchSurfaceMode = useCallback(async (nextMode: NoteSurfaceMode) => {
     setSurfaceMode(nextMode);
@@ -329,18 +387,22 @@ export function NotePad({
   }, [surfaceMode]);
 
   const handleSave = useCallback(async () => {
+    const draft = draftRef.current;
     setErrorMessage(null);
     try {
       await saveNote();
     } catch (error) {
-      setStatus("保存失败");
-      setErrorMessage(getErrorMessage(error));
+      if (draftRef.current === draft) {
+        setStatus("保存失败");
+        setErrorMessage(getErrorMessage(error));
+      }
     }
   }, [saveNote]);
 
   const handleOpenNote = async (noteId: string) => {
     setErrorMessage(null);
     try {
+      if (noteSurfaceAutoSave && hasDraftContent()) await saveNote();
       const note = await getNote(noteId);
       applyNote(note);
       await switchSurfaceMode("pad");
@@ -361,13 +423,36 @@ export function NotePad({
     }
   };
 
-  const handleClose = useCallback(() => {
-    setIsExiting(true);
-    void recycleCurrentNotepad().catch((error) => {
+  const handleClose = useCallback(async () => {
+    if (closingRef.current) return;
+    closingRef.current = true;
+    setIsClosing(true);
+    setErrorMessage(null);
+    try {
+      if (noteSurfaceAutoSave && hasDraftContent()) await saveNote();
+      setIsExiting(true);
+      isStandby.current = true;
+      await recycleCurrentNotepad();
+    } catch (error) {
+      isStandby.current = false;
       setIsExiting(false);
+      setStatus("保存失败");
       setErrorMessage(getErrorMessage(error));
+    } finally {
+      closingRef.current = false;
+      setIsClosing(false);
+    }
+  }, [hasDraftContent, noteSurfaceAutoSave, saveNote]);
+
+  useEffect(() => {
+    const unlisten = getCurrentWindow().onCloseRequested((event) => {
+      event.preventDefault();
+      void handleClose();
     });
-  }, []);
+    return () => {
+      void unlisten.then((fn) => fn());
+    };
+  }, [handleClose]);
 
   const copyTileContent = useCallback(async () => {
     setErrorMessage(null);
@@ -419,7 +504,13 @@ export function NotePad({
   }, [copyTileContent, handleClose, handleSave, switchSurfaceMode]);
 
   useEffect(() => {
-    if (!noteSurfaceAutoSave || mode !== "new" || status !== "未保存") {
+    if (
+      isStandby.current ||
+      isClosing ||
+      !noteSurfaceAutoSave ||
+      mode !== "new" ||
+      status !== "未保存"
+    ) {
       return undefined;
     }
     if (!hasDraftContent()) return undefined;
@@ -429,7 +520,16 @@ export function NotePad({
     }, 900);
 
     return () => window.clearTimeout(timer);
-  }, [handleSave, hasDraftContent, mode, noteSurfaceAutoSave, status]);
+  }, [
+    content,
+    title,
+    handleSave,
+    hasDraftContent,
+    isClosing,
+    mode,
+    noteSurfaceAutoSave,
+    status,
+  ]);
 
   const handleDrag = (event: MouseEvent<HTMLElement>) => {
     const target = event.target as HTMLElement;
@@ -438,6 +538,7 @@ export function NotePad({
   };
 
   const resetDraft = () => {
+    draftRef.current = emptyDraft();
     setEditingNoteId(null);
     setTitle("");
     setContent("");
@@ -481,6 +582,7 @@ export function NotePad({
               <div className="flex items-center gap-0.5">
                 <button
                   onClick={resetDraft}
+                  disabled={isClosing}
                   className={`relative px-3.5 py-1.5 text-[13px] rounded-t-lg transition-all duration-200 cursor-pointer ${
                     mode === "new"
                       ? "text-bamboo font-medium"
@@ -494,6 +596,7 @@ export function NotePad({
                 </button>
                 <button
                   onClick={() => setMode("open")}
+                  disabled={isClosing}
                   className={`relative px-3.5 py-1.5 text-[13px] rounded-t-lg transition-all duration-200 cursor-pointer ${
                     mode === "open"
                       ? "text-bamboo font-medium"
@@ -510,6 +613,7 @@ export function NotePad({
               <div className="flex items-center gap-1.5">
                 <button
                   onClick={() => void handlePin()}
+                  disabled={isClosing}
                   className="group w-7 h-7 flex items-center justify-center rounded-lg transition-all duration-200 cursor-pointer text-ink-ghost hover:text-ink-faint hover:bg-paper-warm"
                   title="转为磁贴"
                 >
@@ -530,6 +634,7 @@ export function NotePad({
 
                 <button
                   onClick={() => void handleClose()}
+                  disabled={isClosing}
                   className="group w-7 h-7 flex items-center justify-center rounded-lg text-ink-ghost hover:bg-danger-bg hover:text-red-400 transition-all duration-200 cursor-pointer"
                   title="关闭"
                 >
@@ -558,7 +663,10 @@ export function NotePad({
                 <input
                   type="text"
                   value={title}
+                  disabled={isClosing}
                   onChange={(event) => {
+                    draftRef.current.title = event.target.value;
+                    draftRef.current.revision++;
                     setTitle(event.target.value);
                     setStatus("未保存");
                   }}
@@ -570,7 +678,10 @@ export function NotePad({
                 <textarea
                   ref={contentRef}
                   value={content}
+                  disabled={isClosing}
                   onChange={(event) => {
+                    draftRef.current.content = event.target.value;
+                    draftRef.current.revision++;
                     setContent(event.target.value);
                     setStatus("未保存");
                   }}
@@ -586,12 +697,14 @@ export function NotePad({
                   <div className="flex items-center gap-2">
                     <button
                       onClick={resetDraft}
+                      disabled={isClosing}
                       className="px-4 py-1.5 text-[12px] text-ink-faint hover:text-ink-soft rounded-lg hover:bg-paper-warm transition-all duration-200 cursor-pointer"
                     >
                       清空
                     </button>
                     <button
                       onClick={() => void handleSave()}
+                      disabled={isClosing}
                       className="px-4 py-1.5 text-[12px] text-cloud bg-bamboo hover:bg-bamboo-light rounded-lg transition-all duration-200 font-medium cursor-pointer"
                     >
                       保存

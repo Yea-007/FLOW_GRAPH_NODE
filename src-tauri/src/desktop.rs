@@ -460,7 +460,8 @@ pub fn recycle_notepad_window(app: &AppHandle, label: &str) -> Result<(), AppErr
         .unwrap_or(false);
 
     if !recycled {
-        window.close()?;
+        // The frontend has already saved; avoid requesting the same close again.
+        window.destroy()?;
     }
 
     Ok(())

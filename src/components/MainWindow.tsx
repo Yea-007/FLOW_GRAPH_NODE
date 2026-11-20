@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { MouseEvent } from "react";
-import { emit } from "@tauri-apps/api/event";
+import { emit, listen } from "@tauri-apps/api/event";
 import { exportMarkdownNote, importMarkdownNote } from "../features/importExport/api";
 import { MarkdownPreview } from "../features/markdown/MarkdownPreview";
 import { migrateLegacyStyles, type EditorDocument } from "../features/markdown/documentModel";
@@ -294,10 +294,13 @@ export function MainWindow({
   const saveQueueRef = useRef<Promise<void>>(Promise.resolve());
   const revisionRef = useRef(0);
   const activeIdRef = useRef<string | null>(null);
+  const saveStateRef = useRef(saveState);
+  saveStateRef.current = saveState;
   const commitDocument = useCallback((next: EditorDocument, typing = false) => {
     historyRef.current.record(JSON.stringify(next), typing);
     documentRef.current = next;
     revisionRef.current++;
+    saveStateRef.current = "dirty";
     setContent(next.content); setRanges(next.ranges); setSaveState("dirty");
   }, []);
   const changeContent = useCallback((next: string, typing = false) => {
@@ -310,6 +313,7 @@ export function MainWindow({
     if (encoded === undefined) return;
     const next: EditorDocument = JSON.parse(encoded);
     documentRef.current = next; revisionRef.current++;
+    saveStateRef.current = "dirty";
     setContent(next.content); setRanges(next.ranges); setSaveState("dirty");
   }, []);
 
@@ -416,6 +420,41 @@ export function MainWindow({
 
   useEffect(() => {
     let cancelled = false;
+    let refreshRevision = 0;
+    const unlisten = listen<string>("notes-changed", (event) => {
+      const request = ++refreshRevision;
+      const revision = revisionRef.current;
+      const canReload = () =>
+        !cancelled &&
+        request === refreshRevision &&
+        activeIdRef.current === event.payload &&
+        revisionRef.current === revision &&
+        saveStateRef.current === "saved";
+      const reloadSelected = canReload();
+
+      void (async () => {
+        try {
+          const loadedNotes = await listNotes();
+          if (cancelled || request !== refreshRevision) return;
+          setNotes(loadedNotes);
+          if (reloadSelected && canReload()) {
+            const note = await getNote(event.payload);
+            if (canReload()) applyNote(note);
+          }
+        } catch (error) {
+          if (!cancelled) setErrorMessage(getErrorMessage(error));
+        }
+      })();
+    });
+
+    return () => {
+      cancelled = true;
+      void unlisten.then((fn) => fn());
+    };
+  }, [applyNote]);
+
+  useEffect(() => {
+    let cancelled = false;
 
     async function bootstrap() {
       setIsLoading(true);
@@ -480,6 +519,7 @@ export function MainWindow({
     const previousSave = saveQueueRef.current;
     let release!: () => void;
     saveQueueRef.current = new Promise<void>(resolve => { release = resolve; });
+    saveStateRef.current = "saving";
     setSaveState("saving");
     try {
       await previousSave;
@@ -757,7 +797,11 @@ export function MainWindow({
   };
 
   const markDirty = () => {
-    if (selectedId) setSaveState("dirty");
+    if (selectedId) {
+      revisionRef.current++;
+      saveStateRef.current = "dirty";
+      setSaveState("dirty");
+    }
   };
 
   const handleOpenNotepad = async () => {
