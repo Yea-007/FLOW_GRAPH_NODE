@@ -1,6 +1,13 @@
+import type { EditorDocument } from "../markdown/documentModel";
+
 export type NoteIcon = { type: "emoji" | "image"; value: string };
 
 export type NoteDropPosition = "before" | "after" | "inside";
+
+export type NoteGroupTarget =
+  | { type: "existing"; id: string }
+  | { type: "named"; title: string }
+  | { type: "root" };
 
 export interface NoteMetadata {
   id: string;
@@ -17,7 +24,7 @@ export interface NoteMetadata {
 
 export interface Note extends Omit<NoteMetadata, "preview"> {
   content: string;
-  styleDocument?: { content: string; ranges: import("../markdown/styleRanges").StyleRange[] } | null;
+  styleDocument?: EditorDocument | null;
 }
 
 export interface SaveNoteRequest {

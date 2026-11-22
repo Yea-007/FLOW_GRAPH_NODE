@@ -5,7 +5,7 @@ import type { ReactNode } from "react";
 import { createRoot } from "react-dom/client";
 import type { Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
-import { createNote, getNote, listNotes, updateNote } from "../features/notes/api";
+import { createNote, getNote, listNotes, saveGroupedNote, saveNoteStyles, updateNote } from "../features/notes/api";
 import { metadataFromNote } from "../features/notes/noteUtils";
 import type { Note } from "../features/notes/types";
 import { getConfig } from "../features/settings/api";
@@ -45,6 +45,8 @@ vi.mock("../features/notes/api", async (importOriginal) => ({
   getNote: vi.fn(),
   listNotes: vi.fn(),
   updateNote: vi.fn(),
+  saveGroupedNote: vi.fn(),
+  saveNoteStyles: vi.fn(),
 }));
 
 vi.mock("../features/settings/api", async (importOriginal) => ({
@@ -138,6 +140,8 @@ beforeEach(() => {
   vi.clearAllMocks();
   vi.mocked(createNote).mockReset().mockImplementation(async (request) => note("new-note", request.content, request.title));
   vi.mocked(updateNote).mockReset().mockImplementation(async (id, request) => note(id, request.content, request.title));
+  vi.mocked(saveGroupedNote).mockReset();
+  vi.mocked(saveNoteStyles).mockReset().mockResolvedValue(undefined);
   vi.mocked(getNote).mockReset();
   vi.mocked(listNotes).mockReset().mockResolvedValue([]);
   vi.mocked(getConfig).mockReset().mockResolvedValue(config);
@@ -275,6 +279,60 @@ describe("small-window saving", () => {
     expect(recycleCurrentNotepad).toHaveBeenCalledOnce();
   });
 
+  test("keeps an empty pad editable when the pin button is clicked", async () => {
+    await mount(<NotePad />);
+    await type("textarea", "  ");
+    await click("转为磁贴");
+    await advance(1000);
+    expect(container.querySelector('[data-surface-mode="pad"] textarea')).toBeTruthy();
+    expect(container.textContent).toContain("填写标题或正文后再转为磁贴");
+    expect(createNote).not.toHaveBeenCalled();
+  });
+
+  test("pins a title-only draft without saving when auto-save is off", async () => {
+    vi.mocked(getConfig).mockResolvedValue({ ...config, noteSurfaceAutoSave: false });
+    await mount(<NotePad />);
+    await type('input[placeholder="标题（可选）"]', "桌面待办");
+    await click("转为磁贴");
+    const tile = container.querySelector('[data-surface-mode="tile"]');
+    expect(tile?.textContent).toBe("桌面待办");
+    expect(createNote).not.toHaveBeenCalled();
+  });
+
+  test("uses an existing group when its exact name is submitted and preserves the draft", async () => {
+    const group = note("circuits", "", "数字电路复习");
+    vi.mocked(listNotes).mockResolvedValue([metadataFromNote(group)]);
+    vi.mocked(saveGroupedNote).mockResolvedValue({ ...note("saved-note", "章末小结"), parentId: group.id });
+    await mount(<NotePad />);
+    await type("textarea", "章末小结");
+    await click("分组");
+    await type('input[aria-label="分组名称"]', group.title);
+    await act(async () => { container.querySelector("form")!.dispatchEvent(new Event("submit", { bubbles: true, cancelable: true })); });
+    expect(container.querySelector("textarea")?.value).toBe("章末小结");
+    expect(container.textContent).toContain("分组 · 数字电路复习");
+    await click("关闭");
+    expect(saveGroupedNote).toHaveBeenCalledExactlyOnceWith(null, { title: "", content: "章末小结" }, { type: "existing", id: group.id });
+    expect(createNote).not.toHaveBeenCalled();
+    expect(recycleCurrentNotepad).toHaveBeenCalledOnce();
+  });
+
+  test("groups an already auto-saved draft under a new name using its existing note ID", async () => {
+    await mount(<NotePad />);
+    await type("textarea", "第一条记录");
+    await advance(900);
+    expect(createNote).toHaveBeenCalledOnce();
+    vi.mocked(saveGroupedNote).mockResolvedValue({ ...note("new-note", "第一条记录"), parentId: "group" });
+    await click("分组");
+    await type('input[aria-label="分组名称"]', "  随手记录  ");
+    await click("新建分组「随手记录」");
+    await click("保存");
+    expect(saveGroupedNote).toHaveBeenCalledExactlyOnceWith("new-note", { title: "", content: "第一条记录" }, { type: "named", title: "随手记录" });
+    await type("textarea", "继续写同一篇");
+    await advance(900);
+    expect(saveGroupedNote).toHaveBeenCalledOnce();
+    expect(updateNote).toHaveBeenCalledExactlyOnceWith("new-note", { title: "", content: "继续写同一篇" });
+  });
+
   test("starts a separate note when a closed pooled window is activated again", async () => {
     await mount(<NotePad />);
     await type("textarea", "第一次打开的内容");
@@ -348,5 +406,52 @@ describe("main-window synchronization", () => {
     await type('input[placeholder="无标题笔记"]', "主窗口修改的标题");
     await act(async () => { pending.resolve(note("shared", "小窗正文", "小窗标题")); });
     expect(container.querySelector<HTMLInputElement>('input[placeholder="无标题笔记"]')!.value).toBe("主窗口修改的标题");
+  });
+});
+
+describe("main-window bookmarks", () => {
+  test("marks the chosen preview line, saves its manual name, and jumps without reloading the note", async () => {
+    const content = "第一行😀\r\n第二行 **粗体**\r\n第三行";
+    const first = note("first", content, "第一篇");
+    const second = note("second", content, "第二篇");
+    vi.mocked(listNotes).mockResolvedValue([metadataFromNote(first), metadataFromNote(second)]);
+    vi.mocked(getNote).mockImplementation(async (id) => id === first.id ? first : second);
+    vi.mocked(saveNoteStyles).mockImplementation(async (id, document) => {
+      if (id === first.id) first.styleDocument = document;
+    });
+    await mount(<MainWindow />);
+
+    expect(container.querySelector('[title="删除笔记"]')?.nextElementSibling?.getAttribute("aria-label")).toBe("标记书签");
+    await click("标记书签");
+    const selectedLine = container.querySelector<HTMLElement>('[data-preview-line="7"]')!;
+    expect(selectedLine.textContent).toContain("第二行");
+    await act(async () => { selectedLine.click(); });
+    expect(selectedLine.hasAttribute("data-bookmarked")).toBe(true);
+    expect(container.querySelector('[data-preview-line="0"]')?.hasAttribute("data-bookmarked")).toBe(false);
+    expect(container.querySelector('[aria-label="当前笔记书签"]')).toBeNull();
+    await click("书签");
+    expect(container.querySelector('[aria-label="当前笔记书签"]')?.textContent).toContain("未命名");
+    await click("重命名书签");
+    await type('input[aria-label="书签名称"]', "复习重点");
+    await click("确定");
+    await click("保存");
+    expect(first.styleDocument?.bookmarks).toEqual([{ id: expect.any(String), name: "复习重点", offset: 7 }]);
+
+    const scroller = selectedLine.closest<HTMLElement>(".overflow-y-auto")!;
+    const scrollTo = vi.spyOn(scroller, "scrollTo");
+    vi.spyOn(selectedLine, "getBoundingClientRect").mockReturnValue({ top: 420, height: 20 } as DOMRect);
+    await click("复习重点第 2 行");
+    expect(scrollTo).toHaveBeenCalledWith(expect.objectContaining({ top: 430 }));
+    expect(getNote).toHaveBeenCalledTimes(1);
+    expect(container.querySelector('[data-preview-line="7"]')).toBe(selectedLine);
+
+    await act(async () => { container.querySelector<HTMLElement>('[data-note-id="second"]')!.click(); });
+    await click("书签");
+    expect(container.textContent).toContain("这篇笔记还没有书签");
+    expect(container.querySelector("[data-bookmarked]")).toBeNull();
+    await act(async () => { container.querySelector<HTMLElement>('[data-note-id="first"]')!.click(); });
+    await click("书签");
+    expect(container.querySelector('[aria-label="当前笔记书签"]')?.textContent).toContain("复习重点");
+    expect(container.querySelector('[data-preview-line="7"]')?.hasAttribute("data-bookmarked")).toBe(true);
   });
 });

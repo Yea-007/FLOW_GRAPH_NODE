@@ -43,6 +43,9 @@ import {
 } from "../features/notes/noteContextMenu";
 import { NoteTree } from "../features/notes/NoteTree";
 import { NoteIconPicker, type NoteIconAnchor } from "../features/notes/NoteIconPicker";
+import { BookmarkIcon, BookmarkMenu } from "../features/notes/BookmarkMenu";
+import { rebaseBookmarks, sourceLines } from "../features/notes/bookmarks";
+import type { NoteBookmark } from "../features/notes/bookmarks";
 import { ResizeHandle } from "./ResizeHandle";
 import { openNotepadWindow, openTileWindow } from "../features/windows/api";
 import {
@@ -73,6 +76,7 @@ const MIN_SIDEBAR_WIDTH = 180;
 const MIN_EDITOR_WIDTH = 200;
 const MIN_PREVIEW_WIDTH = 200;
 const DEFAULT_SIDEBAR_WIDTH = 280;
+const emptyBookmarks: NoteBookmark[] = [];
 
 type FormatAction = "bold" | "italic" | "heading" | "hr" | "ul" | "ol" | "code" | "quote" | "strike" | "task" | "link" | "image" | "codeblock";
 
@@ -286,7 +290,11 @@ export function MainWindow({
   const [sidebarWidth, setSidebarWidth] = useState(DEFAULT_SIDEBAR_WIDTH);
   const [splitRatio, setSplitRatio] = useState(0.5);
   const contentRef = useRef<HTMLTextAreaElement>(null);
+  const previewScrollRef = useRef<HTMLDivElement>(null);
   const [ranges, setRanges] = useState<StyleRange[]>([]);
+  const [bookmarks, setBookmarks] = useState<NoteBookmark[]>(emptyBookmarks);
+  const [markingBookmark, setMarkingBookmark] = useState(false);
+  const [bookmarkJump, setBookmarkJump] = useState<{ offset: number } | null>(null);
   const documentRef = useRef<EditorDocument>({ content: "", ranges: [] });
   const historyRef = useRef(new ContentHistory(JSON.stringify(documentRef.current)));
   const styleConflictRef = useRef(false);
@@ -301,11 +309,16 @@ export function MainWindow({
     documentRef.current = next;
     revisionRef.current++;
     saveStateRef.current = "dirty";
-    setContent(next.content); setRanges(next.ranges); setSaveState("dirty");
+    setContent(next.content); setRanges(next.ranges); setBookmarks(next.bookmarks ?? emptyBookmarks); setSaveState("dirty");
   }, []);
-  const changeContent = useCallback((next: string, typing = false) => {
+  const changeContent = useCallback((next: string, typing = false, sourceEdit?: { start: number; end: number; text: string }) => {
     const current = documentRef.current;
-    commitDocument({ content: next, ranges: rebaseStyles(current.ranges, findTextEdit(current.content, next)) }, typing);
+    const edit = sourceEdit ?? findTextEdit(current.content, next);
+    commitDocument({
+      content: next,
+      ranges: rebaseStyles(current.ranges, edit),
+      bookmarks: rebaseBookmarks(current.bookmarks, current.content, next, edit),
+    }, typing);
   }, [commitDocument]);
   const formatContent = useCallback((next: string) => changeContent(next), [changeContent]);
   const restoreHistory = useCallback((redo: boolean) => {
@@ -314,11 +327,12 @@ export function MainWindow({
     const next: EditorDocument = JSON.parse(encoded);
     documentRef.current = next; revisionRef.current++;
     saveStateRef.current = "dirty";
-    setContent(next.content); setRanges(next.ranges); setSaveState("dirty");
+    setContent(next.content); setRanges(next.ranges); setBookmarks(next.bookmarks ?? emptyBookmarks); setSaveState("dirty");
   }, []);
 
   useEffect(() => {
     function handleUndo(event: KeyboardEvent) {
+      if (event.key === "Escape") setMarkingBookmark(false);
       const target = event.target as HTMLElement;
       if (!target.closest("[data-note-editor]")) return;
       if (target.closest("textarea") && target !== contentRef.current) return;
@@ -351,7 +365,7 @@ export function MainWindow({
     [filteredNotes],
   );
 
-  const lineCount = useMemo(() => content.split("\n").length, [content]);
+  const lines = useMemo(() => sourceLines(content), [content]);
   const byteSize = useMemo(
     () => (new TextEncoder().encode(content).length / 1024).toFixed(1),
     [content],
@@ -361,16 +375,19 @@ export function MainWindow({
   const applyNote = useCallback((note: Note) => {
     setSelectedId(note.id);
     setTitle(note.title);
-    const migrated = migrateLegacyStyles(note.content);
     const saved = note.styleDocument;
-    const conflict = !!saved && saved.content !== note.content;
-    const next = saved && !conflict ? saved : migrated;
+    const stale = !!saved && saved.content !== note.content;
+    const conflict = stale && saved.ranges.length > 0;
+    const next = saved && !stale ? saved : migrateLegacyStyles(note.content);
+    if (stale) next.bookmarks = rebaseBookmarks(saved.bookmarks, saved.content, next.content);
     styleConflictRef.current = conflict; setStyleConflict(conflict);
     activeIdRef.current = note.id;
     revisionRef.current++;
     documentRef.current = next;
     historyRef.current = new ContentHistory(JSON.stringify(next));
-    setContent(next.content); setRanges(next.ranges);
+    setContent(next.content); setRanges(next.ranges); setBookmarks(next.bookmarks ?? emptyBookmarks);
+    setMarkingBookmark(false);
+    setBookmarkJump(null);
     setSaveState("saved");
     setErrorMessage(conflict ? "正文与保存的格式版本不同，旧格式已保留。当前笔记暂不可保存，请先恢复正文版本或备份后处理格式冲突。" : null);
     setNoteTransitionKey((k) => k + 1);
@@ -414,7 +431,9 @@ export function MainWindow({
     styleConflictRef.current = false; setStyleConflict(false);
     documentRef.current = { content: "", ranges: [] };
     historyRef.current = new ContentHistory(JSON.stringify(documentRef.current));
-    setContent(""); setRanges([]);
+    setContent(""); setRanges([]); setBookmarks(emptyBookmarks);
+    setMarkingBookmark(false);
+    setBookmarkJump(null);
     setSaveState("idle");
   }, []);
 
@@ -560,7 +579,32 @@ export function MainWindow({
     }, 900);
 
     return () => window.clearTimeout(timer);
-  }, [saveCurrentNote, saveState, selectedId, settingsConfig?.noteAutoSave]);
+  }, [bookmarks, ranges, saveCurrentNote, saveState, selectedId, settingsConfig?.noteAutoSave]);
+
+  const markBookmark = (offset: number) => {
+    setMarkingBookmark(false);
+    const current = documentRef.current;
+    const bookmarks = current.bookmarks ?? emptyBookmarks;
+    if (bookmarks.some((bookmark) => bookmark.offset === offset)) return;
+    commitDocument({ ...current, bookmarks: [...bookmarks, { id: crypto.randomUUID(), name: "", offset }] });
+  };
+
+  const renameBookmark = (id: string, name: string) => {
+    const current = documentRef.current;
+    if (!current.bookmarks?.some((bookmark) => bookmark.id === id && bookmark.name !== name)) return;
+    commitDocument({ ...current, bookmarks: current.bookmarks.map((bookmark) => bookmark.id === id ? { ...bookmark, name } : bookmark) });
+  };
+
+  const removeBookmark = (id: string) => {
+    const current = documentRef.current;
+    commitDocument({ ...current, bookmarks: current.bookmarks?.filter((bookmark) => bookmark.id !== id) });
+  };
+
+  const jumpToBookmark = (offset: number) => {
+    setMarkingBookmark(false);
+    if (viewMode === "edit") setViewMode("preview");
+    setBookmarkJump({ offset });
+  };
 
   const handleNewNote = async () => {
     setErrorMessage(null);
@@ -1217,6 +1261,21 @@ export function MainWindow({
                     </svg>
                   </button>
                 )}
+
+                <button
+                  type="button"
+                  onClick={() => {
+                    if (viewMode === "edit") setViewMode("preview");
+                    setMarkingBookmark(!markingBookmark);
+                  }}
+                  disabled={!selectedId || !content.trim()}
+                  aria-label="标记书签"
+                  aria-pressed={markingBookmark}
+                  title={markingBookmark ? "取消标记书签" : "标记书签"}
+                  className={`w-7 h-7 flex items-center justify-center rounded-lg transition-colors cursor-pointer hover:bg-bamboo-mist hover:text-bamboo disabled:opacity-30 disabled:cursor-not-allowed ${markingBookmark ? "bg-bamboo-mist text-bamboo" : "text-ink-ghost"}`}
+                >
+                  <BookmarkIcon />
+                </button>
               </div>
 
               <SlidingButtonGroup
@@ -1226,12 +1285,12 @@ export function MainWindow({
                   { value: "preview" as ViewMode, label: "预览" },
                 ]}
                 value={viewMode}
-                onChange={setViewMode}
+                onChange={(mode) => { setMarkingBookmark(false); setBookmarkJump(null); setViewMode(mode); }}
                 buttonClassName="px-3 py-1"
               />
             </div>
 
-            <div key={noteTransitionKey} className="animate-note-enter px-6 pt-4 pb-2 shrink-0 border-b border-paper-deep/15">
+            <div key={noteTransitionKey} className="relative z-20 animate-note-enter px-6 pt-4 pb-2 shrink-0 border-b border-paper-deep/15">
               <input
                 type="text"
                 value={title}
@@ -1270,6 +1329,15 @@ export function MainWindow({
                 >
                   {saveStateLabel[saveState]}
                 </span>
+                {selectedId && (
+                  <BookmarkMenu
+                    bookmarks={bookmarks}
+                    lines={lines}
+                    onJump={jumpToBookmark}
+                    onRename={renameBookmark}
+                    onRemove={removeBookmark}
+                  />
+                )}
               </div>
             </div>
 
@@ -1345,6 +1413,7 @@ export function MainWindow({
                         </div>
                       )}
                       <div
+                        ref={previewScrollRef}
                         className={`flex-1 overflow-y-auto px-6 pb-6 ${
                           viewMode === "preview" ? "pt-3" : "pt-1"
                         }`}
@@ -1353,10 +1422,17 @@ export function MainWindow({
                           key={selectedId}
                           content={content}
                           ranges={ranges}
+                          bookmarks={bookmarks}
+                          onMarkBookmark={markingBookmark ? markBookmark : undefined}
+                          bookmarkJump={bookmarkJump}
+                          scrollRef={previewScrollRef}
                           onUndo={() => restoreHistory(false)}
                           onRedo={() => restoreHistory(true)}
                           onStyle={(start, end, property, value) => commitDocument({ ...documentRef.current, ranges: setRangeStyle(documentRef.current.ranges, start, end, property, value) })}
-                          onEdit={(start, end, text) => { const current = documentRef.current; commitDocument({ content: current.content.slice(0,start) + text + current.content.slice(end), ranges: rebaseStyles(current.ranges, { start, end, text }) }); }}
+                          onEdit={(start, end, text) => {
+                            const current = documentRef.current.content;
+                            changeContent(current.slice(0, start) + text + current.slice(end), false, { start, end, text });
+                          }}
                           fontSize={settingsConfig?.fontSize ?? 14}
                           notesDir={settingsConfig?.notesDir}
                         />
@@ -1370,7 +1446,7 @@ export function MainWindow({
             <div className="flex items-center justify-between px-4 h-7 border-t border-paper-deep/20 bg-paper/30 shrink-0">
               <div className="flex items-center gap-3">
                 <span className="text-[10px] text-ink-ghost font-mono tabular-nums">
-                  Ln {lineCount}
+                  Ln {lines.length}
                 </span>
                 <span className="text-[10px] text-ink-ghost/40">|</span>
                 <span className="text-[10px] text-ink-ghost font-mono">

@@ -1,15 +1,16 @@
-import { useEffect, useMemo, useState, useRef } from "react";
+import { useEffect, useLayoutEffect, useMemo, useState, useRef } from "react";
+import type { MouseEvent, RefObject } from "react";
 import { mappedPreviewPlugin, sourceSelection } from "./previewMapping";
 import type { StyleRange } from "./styleRanges";
 import Markdown from "react-markdown";
 import remarkGfm from "remark-gfm";
-import remarkBreaks from "remark-breaks";
 import remarkMath from "remark-math";
 import rehypeKatex from "rehype-katex";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import type { Components } from "react-markdown";
 import { resolveImagePath } from "./imagePaths";
 import { readFileBase64 } from "../notes/api";
+import type { NoteBookmark } from "../notes/bookmarks";
 
 interface MarkdownPreviewProps {
   content: string;
@@ -20,10 +21,14 @@ interface MarkdownPreviewProps {
   onRedo?: () => void;
   onStyle?: (start: number, end: number, property: "color" | "background" | "size", value: string | number | undefined) => void;
   onEdit?: (start: number, end: number, text: string) => void;
+  bookmarks?: NoteBookmark[];
+  onMarkBookmark?: (offset: number) => void;
+  bookmarkJump?: { offset: number } | null;
+  scrollRef?: RefObject<HTMLDivElement | null>;
 }
 
-const remarkPlugins = [remarkGfm, remarkBreaks, remarkMath];
-const rehypePlugins = [rehypeKatex];
+const remarkPlugins = [remarkGfm, remarkMath];
+const emptyRanges: StyleRange[] = [];
 
 function ImgRenderer({ src, alt, notesDir }: { src?: string; alt?: string; notesDir?: string }) {
   const targetPath = resolveImagePath(src ?? "", notesDir);
@@ -126,11 +131,11 @@ function buildComponents(notesDir?: string): Components {
     li: ({ children }) => (
       <li className="text-ink-soft leading-[1.9]">{children}</li>
     ),
-    hr: () => (
-      <hr className="my-6 border-none h-px bg-gradient-to-r from-transparent via-paper-deep to-transparent" />
+    hr: ({ node }) => (
+      <hr data-preview-line={node?.properties.dataPreviewLine as number | undefined} className="my-6 border-none h-px bg-gradient-to-r from-transparent via-paper-deep to-transparent" />
     ),
-    code: ({ className, children }) => {
-      const isBlock = className?.startsWith("language-") || String(children).includes("\n");
+    code: ({ node, children }) => {
+      const isBlock = node?.properties.dataPreviewCodeBlock === true;
       if (isBlock) {
         return (
           <code className="text-[12px] font-mono text-ink-soft leading-[1.8] whitespace-pre">
@@ -139,7 +144,7 @@ function buildComponents(notesDir?: string): Components {
         );
       }
       return (
-        <code className="px-1.5 py-0.5 text-[12px] font-mono bg-paper-warm rounded text-bamboo">
+        <code data-preview-line={node?.properties.dataPreviewLine as number | undefined} className="px-1.5 py-0.5 text-[12px] font-mono bg-paper-warm rounded text-bamboo">
           {children}
         </code>
       );
@@ -174,7 +179,11 @@ function buildComponents(notesDir?: string): Components {
         {children}
       </a>;
     },
-    img: ({ src, alt }) => <ImgRenderer src={src} alt={alt} notesDir={notesDir} />,
+    img: ({ src, alt, node }) => (
+      <span data-preview-line={node?.properties.dataPreviewLine as number | undefined} className="block w-fit max-w-full">
+        <ImgRenderer src={src} alt={alt} notesDir={notesDir} />
+      </span>
+    ),
     table: ({ children }) => (
       <div className="my-3 overflow-x-auto">
         <table className="w-full text-[13px] border-collapse">{children}</table>
@@ -201,13 +210,55 @@ function buildComponents(notesDir?: string): Components {
   };
 }
 
-export function MarkdownPreview({ content, fontSize = 14, notesDir, ranges = [], onStyle, onEdit, onUndo, onRedo }: MarkdownPreviewProps) {
+export function MarkdownPreview({
+  content, fontSize = 14, notesDir, ranges = emptyRanges, onStyle, onEdit, onUndo, onRedo,
+  bookmarks, onMarkBookmark, bookmarkJump, scrollRef,
+}: MarkdownPreviewProps) {
   const root = useRef<HTMLDivElement>(null);
   const [selection, setSelection] = useState<{ start: number; end: number } | null>(null);
   const [editing, setEditing] = useState<{ start: number; end: number; text: string } | null>(null);
   useEffect(() => { setSelection(null); setEditing(null); }, [content]);
   const components = useMemo(() => buildComponents(notesDir), [notesDir]);
-  const plugins = useMemo(() => [mappedPreviewPlugin(content, ranges), ...rehypePlugins], [content, ranges]);
+  const preview = useMemo(() => (
+    content.trim() ? (
+      <Markdown remarkPlugins={remarkPlugins} rehypePlugins={[mappedPreviewPlugin(content, ranges), rehypeKatex]} components={components}>{content}</Markdown>
+    ) : <p className="text-ink-ghost leading-[1.9]">在源码区开始写作，预览中的文字可双击修改</p>
+  ), [components, content, ranges]);
+
+  useLayoutEffect(() => {
+    const marked = bookmarks?.flatMap(({ offset }) => Array.from(
+      root.current?.querySelectorAll(`[data-preview-line="${offset}"]`) ?? [],
+    )) ?? [];
+    for (const element of marked) element.setAttribute("data-bookmarked", "");
+    return () => { for (const element of marked) element.removeAttribute("data-bookmarked"); };
+  }, [bookmarks, preview]);
+
+  useLayoutEffect(() => {
+    if (!bookmarkJump) return;
+    const target = root.current?.querySelector(`[data-preview-line="${bookmarkJump.offset}"]`);
+    const scroller = scrollRef?.current;
+    if (!target || !scroller) return;
+    const { top, height } = target.getBoundingClientRect();
+    scroller.scrollTo({
+      top: scroller.scrollTop + top - scroller.getBoundingClientRect().top - (scroller.clientHeight - height) / 2,
+      behavior: window.matchMedia("(prefers-reduced-motion: reduce)").matches ? "auto" : "smooth",
+    });
+  }, [bookmarkJump, scrollRef]);
+
+  function pickBookmark(event: MouseEvent<HTMLDivElement>) {
+    if (!onMarkBookmark) return;
+    event.preventDefault();
+    event.stopPropagation();
+    const target = event.target as HTMLElement;
+    let line = target.closest<HTMLElement>("[data-preview-line]");
+    if (!line) {
+      line = Array.from(target.querySelectorAll<HTMLElement>("[data-preview-line]")).find((candidate) =>
+        Array.from(candidate.getClientRects()).some((rect) => event.clientY >= rect.top && event.clientY < rect.bottom),
+      ) ?? null;
+    }
+    if (line?.dataset.previewLine !== undefined) onMarkBookmark(Number(line.dataset.previewLine));
+  }
+
   return <div className="flex flex-col min-h-0 h-full">
     {onStyle && <div className="flex flex-wrap gap-1 py-2 sticky top-0 bg-cloud z-10 border-b border-paper-deep" role="toolbar" aria-label="预览文字格式">
       {(["color", "background", "size"] as const).map(property => <select key={property} aria-label={property === "color" ? "文字颜色" : property === "background" ? "背景颜色" : "文字大小"} className="format-select" disabled={!selection} value="" onChange={e => { if (selection) onStyle(selection.start, selection.end, property, e.target.value === "default" ? undefined : property === "size" ? Number(e.target.value) : e.target.value); }}>
@@ -216,19 +267,21 @@ export function MarkdownPreview({ content, fontSize = 14, notesDir, ranges = [],
       </select>)}
       <button type="button" title="撤销 Ctrl+Z" className="format-select" onClick={onUndo}>撤销</button>
       <button type="button" title="重做 Ctrl+Y" className="format-select" onClick={onRedo}>重做</button>
-      <span className="text-xs text-ink-faint self-center">选中文字设置格式 · 双击文字编辑</span>
+      {onMarkBookmark ? (
+        <span role="status" className="text-xs text-bamboo self-center">点击预览中的一行添加书签，按 Esc 取消</span>
+      ) : <span className="text-xs text-ink-faint self-center">选中文字设置格式 · 双击文字编辑</span>}
     </div>}
     {editing && <div className="my-2 p-2 border border-bamboo rounded bg-paper-warm">
       <textarea aria-label="修改预览文字" autoFocus className="w-full text-ink min-h-20" value={editing.text} onChange={e => setEditing({ ...editing, text: e.target.value })} />
       <button className="px-3 py-1 text-bamboo" onClick={() => { onEdit?.(editing.start, editing.end, editing.text); setEditing(null); requestAnimationFrame(() => root.current?.focus()); }}>应用修改</button>
       <button className="px-3 py-1 text-ink-soft" onClick={() => setEditing(null)}>取消</button>
     </div>}
-    <div ref={root} tabIndex={onEdit ? 0 : undefined} className="max-w-[560px] font-body" style={{ fontSize: `${fontSize}px` }} onMouseUp={() => { if (root.current) setSelection(sourceSelection(root.current)); }} onKeyUp={() => { if (root.current) setSelection(sourceSelection(root.current)); }} onDoubleClick={e => {
+    <div ref={root} tabIndex={onEdit ? 0 : undefined} data-bookmark-picking={onMarkBookmark ? "true" : undefined} className="max-w-[560px] font-body" style={{ fontSize: `${fontSize}px` }} onClickCapture={pickBookmark} onMouseUp={() => { if (root.current && !onMarkBookmark) setSelection(sourceSelection(root.current)); }} onKeyUp={() => { if (root.current) setSelection(sourceSelection(root.current)); }} onDoubleClick={e => {
       if (!onEdit) return;
       const target = (e.target as HTMLElement).closest<HTMLElement>("[data-source-start]");
       if (target) { const start = Number(target.dataset.sourceStart), end = Number(target.dataset.sourceEnd); setEditing({ start, end, text: content.slice(start,end) }); }
     }}>
-      {content.trim() ? <Markdown remarkPlugins={remarkPlugins} rehypePlugins={plugins} components={components}>{content}</Markdown> : <p className="text-ink-ghost leading-[1.9]">在源码区开始写作，预览中的文字可双击修改</p>}
+      {preview}
     </div>
   </div>;
 }

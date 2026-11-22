@@ -5,9 +5,11 @@ import {
   getErrorMessage,
   getNote,
   listNotes,
+  saveGroupedNote,
   updateNote,
 } from "../features/notes/api";
-import type { Note, NoteMetadata } from "../features/notes/types";
+import type { Note, NoteGroupTarget, NoteMetadata } from "../features/notes/types";
+import { NoteGroupPicker } from "../features/notes/NoteGroupPicker";
 import {
   countNoteChars,
   formatShortDate,
@@ -46,7 +48,8 @@ import {
 import type { NoteSurfaceMode } from "../features/windows/surfaceMode";
 import { Tile } from "./Tile";
 
-type OpenMode = "new" | "open";
+type OpenMode = "new" | "open" | "group";
+const noGroup: NoteGroupTarget = { type: "root" };
 
 interface NotePadProps {
   initialNoteId?: string;
@@ -62,6 +65,8 @@ interface NoteDraft {
   revision: number;
   savedRevision: number;
   savedNote: Note | null;
+  group?: NoteGroupTarget;
+  savedGroup?: NoteGroupTarget;
 }
 
 function emptyDraft(): NoteDraft {
@@ -73,6 +78,10 @@ function emptyDraft(): NoteDraft {
     savedRevision: 0,
     savedNote: null,
   };
+}
+
+function hasNoteText(draft: NoteDraft) {
+  return Boolean(draft.title.trim() || draft.content.trim());
 }
 
 const surfaceResizeHandles: Array<{
@@ -137,6 +146,7 @@ export function NotePad({
   const [editingNoteId, setEditingNoteId] = useState<string | null>(null);
   const [title, setTitle] = useState("");
   const [content, setContent] = useState("");
+  const [group, setGroup] = useState<NoteGroupTarget>(noGroup);
   const [hoveredNote, setHoveredNote] = useState<string | null>(null);
   const [status, setStatus] = useState("空");
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
@@ -180,6 +190,7 @@ export function NotePad({
     setEditingNoteId(note.id);
     setTitle(note.title);
     setContent(note.content);
+    setGroup(note.parentId ? { type: "existing", id: note.parentId } : noGroup);
     setMode("new");
     setStatus("已打开");
   }, []);
@@ -288,6 +299,7 @@ export function NotePad({
       setEditingNoteId(null);
       setTitle("");
       setContent("");
+      setGroup(noGroup);
       setMode("new");
       setStatus("空");
       setErrorMessage(null);
@@ -307,17 +319,21 @@ export function NotePad({
     const draft = draftRef.current;
     const revision = draft.revision;
     const request = { title: draft.title, content: draft.content };
+    const destination = draft.group;
     const pending = saveQueueRef.current.then(async () => {
       if (draft.savedNote && draft.savedRevision >= revision) {
         return draft.savedNote;
       }
 
-      const note = draft.noteId
-        ? await updateNote(draft.noteId, request)
-        : await createNote(request);
+      const note = destination && destination !== draft.savedGroup
+        ? await saveGroupedNote(draft.noteId, request, destination)
+        : draft.noteId
+          ? await updateNote(draft.noteId, request)
+          : await createNote(request);
       draft.noteId = note.id;
       draft.savedRevision = revision;
       draft.savedNote = note;
+      draft.savedGroup = destination;
 
       setNotes((current) => {
         const metadata = metadataFromNote(note);
@@ -345,7 +361,7 @@ export function NotePad({
 
   const hasDraftContent = useCallback(() => {
     const draft = draftRef.current;
-    return Boolean(draft.noteId || draft.title.trim() || draft.content.trim());
+    return Boolean(draft.noteId || hasNoteText(draft));
   }, []);
 
   const switchSurfaceMode = useCallback(async (nextMode: NoteSurfaceMode) => {
@@ -369,6 +385,7 @@ export function NotePad({
     function handleSurfaceModeRequest(event: Event) {
       const nextMode = surfaceModeFromEvent(event);
       if (!nextMode) return;
+      if (nextMode === "tile" && !hasNoteText(draftRef.current)) return;
       void switchSurfaceMode(nextMode);
     }
 
@@ -412,14 +429,25 @@ export function NotePad({
   };
 
   const handlePin = async () => {
+    const draft = draftRef.current;
+    if (!hasNoteText(draft)) {
+      setMode("new");
+      setErrorMessage("填写标题或正文后再转为磁贴");
+      contentRef.current?.focus();
+      return;
+    }
     setErrorMessage(null);
     try {
       if (shouldSaveBeforeSwitchingToTile(noteSurfaceAutoSave)) {
         await saveNote();
       }
+      if (draftRef.current !== draft || closingRef.current || !hasNoteText(draft)) return;
       await switchSurfaceMode("tile");
     } catch (error) {
-      setErrorMessage(getErrorMessage(error));
+      if (draftRef.current === draft) {
+        setMode("new");
+        setErrorMessage(getErrorMessage(error));
+      }
     }
   };
 
@@ -523,6 +551,7 @@ export function NotePad({
   }, [
     content,
     title,
+    group,
     handleSave,
     hasDraftContent,
     isClosing,
@@ -542,10 +571,30 @@ export function NotePad({
     setEditingNoteId(null);
     setTitle("");
     setContent("");
+    setGroup(noGroup);
     setMode("new");
     setStatus("空");
     setErrorMessage(null);
   };
+
+  const openGroupPicker = () => {
+    setErrorMessage(null);
+    setMode("group");
+    void refreshNotes().catch((error) => setErrorMessage(getErrorMessage(error)));
+  };
+
+  const selectGroup = (destination: NoteGroupTarget) => {
+    const draft = draftRef.current;
+    draft.group = destination;
+    draft.revision++;
+    setGroup(destination);
+    setStatus("未保存");
+    setErrorMessage(null);
+    setMode("new");
+  };
+
+  const parent = group.type === "existing" ? notes.find((note) => note.id === group.id) : undefined;
+  const groupTitle = group.type === "named" ? group.title : parent ? getDisplayTitle(parent) : null;
 
   const isTile = surfaceMode === "tile";
   const tileNoteId = editingNoteId ?? initialNoteId ?? "";
@@ -576,14 +625,14 @@ export function NotePad({
         <div className={padSurfaceClassName} data-surface-mode={surfaceMode}>
           <>
             <div
-              className="flex items-center justify-between px-4 pt-3 pb-0 cursor-grab active:cursor-grabbing"
+              className="flex items-center justify-between px-3 pt-3 pb-0 cursor-grab active:cursor-grabbing"
               onMouseDown={handleDrag}
             >
               <div className="flex items-center gap-0.5">
                 <button
-                  onClick={resetDraft}
+                  onClick={() => { if (mode === "new") resetDraft(); else setMode("new"); }}
                   disabled={isClosing}
-                  className={`relative px-3.5 py-1.5 text-[13px] rounded-t-lg transition-all duration-200 cursor-pointer ${
+                  className={`relative px-2.5 py-1.5 text-[13px] rounded-t-lg transition-all duration-200 cursor-pointer ${
                     mode === "new"
                       ? "text-bamboo font-medium"
                       : "text-ink-ghost hover:text-ink-faint"
@@ -597,7 +646,7 @@ export function NotePad({
                 <button
                   onClick={() => setMode("open")}
                   disabled={isClosing}
-                  className={`relative px-3.5 py-1.5 text-[13px] rounded-t-lg transition-all duration-200 cursor-pointer ${
+                  className={`relative px-2.5 py-1.5 text-[13px] rounded-t-lg transition-all duration-200 cursor-pointer ${
                     mode === "open"
                       ? "text-bamboo font-medium"
                       : "text-ink-ghost hover:text-ink-faint"
@@ -607,6 +656,17 @@ export function NotePad({
                   {mode === "open" && (
                     <div className="absolute bottom-0 left-3 right-3 h-[2px] bg-bamboo rounded-full" />
                   )}
+                </button>
+                <button
+                  type="button"
+                  onClick={() => mode === "group" ? setMode("new") : openGroupPicker()}
+                  disabled={isClosing}
+                  aria-expanded={mode === "group"}
+                  title={groupTitle ? `当前分组：${groupTitle}` : "选择或新建分组"}
+                  className={`relative px-2.5 py-1.5 text-[13px] rounded-t-lg transition-all duration-200 cursor-pointer ${mode === "group" ? "text-bamboo font-medium" : "text-ink-ghost hover:text-ink-faint"}`}
+                >
+                  分组
+                  {mode === "group" && <span className="absolute bottom-0 left-3 right-3 h-[2px] bg-bamboo rounded-full" />}
                 </button>
               </div>
 
@@ -669,11 +729,18 @@ export function NotePad({
                     draftRef.current.revision++;
                     setTitle(event.target.value);
                     setStatus("未保存");
+                    setErrorMessage(null);
                   }}
                   placeholder="标题（可选）"
                   className="w-full font-display font-medium text-ink placeholder:text-ink-ghost/60 mb-2 tracking-wide shrink-0"
                   style={{ fontSize: `${surfaceFontSize}px` }}
                 />
+
+                {groupTitle && (
+                  <button type="button" title={groupTitle} disabled={isClosing} onClick={openGroupPicker} className="mb-1 max-w-full shrink-0 self-start truncate text-left text-[11px] text-bamboo hover:underline cursor-pointer">
+                    分组 · {groupTitle}
+                  </button>
+                )}
 
                 <textarea
                   ref={contentRef}
@@ -684,6 +751,7 @@ export function NotePad({
                     draftRef.current.revision++;
                     setContent(event.target.value);
                     setStatus("未保存");
+                    setErrorMessage(null);
                   }}
                   placeholder="写点什么……"
                   className="w-full flex-1 min-h-0 pb-2 leading-relaxed text-ink-soft font-body placeholder:text-ink-ghost/50"
@@ -691,27 +759,29 @@ export function NotePad({
                 />
 
                 <div className="flex items-center justify-between mt-auto pt-2 border-t border-paper-deep/30 shrink-0">
-                  <span className="text-[11px] text-ink-ghost font-mono tabular-nums truncate max-w-[170px]">
+                  <span role={errorMessage ? "status" : undefined} title={errorMessage ?? undefined} className={`min-w-0 text-[11px] font-mono tabular-nums ${errorMessage ? "pr-1 text-red-500" : "truncate text-ink-ghost"}`}>
                     {errorMessage ?? `${countNoteChars(content)} 字 · ${status}`}
                   </span>
-                  <div className="flex items-center gap-2">
+                  <div className="flex shrink-0 items-center gap-1">
                     <button
                       onClick={resetDraft}
                       disabled={isClosing}
-                      className="px-4 py-1.5 text-[12px] text-ink-faint hover:text-ink-soft rounded-lg hover:bg-paper-warm transition-all duration-200 cursor-pointer"
+                      className="px-2.5 py-1.5 text-[12px] text-ink-faint hover:text-ink-soft rounded-lg hover:bg-paper-warm transition-all duration-200 cursor-pointer"
                     >
                       清空
                     </button>
                     <button
                       onClick={() => void handleSave()}
                       disabled={isClosing}
-                      className="px-4 py-1.5 text-[12px] text-cloud bg-bamboo hover:bg-bamboo-light rounded-lg transition-all duration-200 font-medium cursor-pointer"
+                      className="px-3.5 py-1.5 text-[12px] text-cloud bg-bamboo hover:bg-bamboo-light rounded-lg transition-all duration-200 font-medium cursor-pointer"
                     >
                       保存
                     </button>
                   </div>
                 </div>
               </div>
+            ) : mode === "group" ? (
+              <NoteGroupPicker notes={notes} noteId={editingNoteId} disabled={isClosing} error={errorMessage} onSelect={selectGroup} onCancel={() => setMode("new")} />
             ) : (
               <div className="p-2 flex-1 min-h-0 overflow-y-auto">
                 <div className="space-y-0.5">

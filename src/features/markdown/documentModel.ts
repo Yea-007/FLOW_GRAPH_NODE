@@ -1,7 +1,12 @@
 import { fromMarkdown } from "mdast-util-from-markdown";
+import type { NoteBookmark } from "../notes/bookmarks";
 import type { StyleRange } from "./styleRanges";
 
-export interface EditorDocument { content: string; ranges: StyleRange[] }
+export interface EditorDocument {
+  content: string;
+  ranges: StyleRange[];
+  bookmarks?: NoteBookmark[];
+}
 
 /** Migrate only parsed links. Fenced/inline code containing the same text stays intact. */
 export function migrateLegacyStyles(content: string): EditorDocument {

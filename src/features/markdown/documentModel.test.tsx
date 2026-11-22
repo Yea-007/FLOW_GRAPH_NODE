@@ -3,6 +3,7 @@ import { describe, expect, test } from "vitest";
 import { migrateLegacyStyles } from "./documentModel";
 import { MarkdownPreview } from "./MarkdownPreview";
 import { ContentHistory } from "./contentHistory";
+import { rebaseBookmarks } from "../notes/bookmarks";
 
 describe("two layer document", () => {
   test("migrates only real legacy links, keeping code and Markdown emphasis", () => {
@@ -28,5 +29,21 @@ describe("two layer document", () => {
     history.record(JSON.stringify(after));
     expect(JSON.parse(history.undo()!)).toEqual(before);
     expect(JSON.parse(history.redo()!)).toEqual(after);
+  });
+  test("maps preview rows through quotes, code fences, and tables", () => {
+    const lines = ["> 引用一", "> **引用二**", "", "```js", "代码一", "代码二", "```", "", "| 标题 |", "| --- |", "| 表格内容 |"];
+    const content = lines.join("\n");
+    const markup = renderToStaticMarkup(<MarkdownPreview content={content} />);
+    const offset = (index: number) => lines.slice(0, index).reduce((sum, line) => sum + line.length + 1, 0);
+    expect(markup).toContain(`<br/><strong class="font-semibold text-ink"><span data-preview-line="${offset(1)}"`);
+    expect(markup).toContain(`<span data-preview-line="${offset(5)}">代码二</span>`);
+    expect(markup).toContain(`<tr data-preview-line="${offset(10)}">`);
+  });
+  test("retains a bookmark when lines are inserted above it or its text is edited", () => {
+    const bookmark = { id: "bookmark", name: "", offset: 4 };
+    const original = "😀\r\n复习重点\r\n结尾";
+    expect(rebaseBookmarks([bookmark], original, "插入\n" + original)).toEqual([{ ...bookmark, offset: 7 }]);
+    expect(rebaseBookmarks([bookmark], original, "😀\r\n修改后的复习重点\r\n结尾")).toEqual([bookmark]);
+    expect(rebaseBookmarks([bookmark], original, "😀\r\n结尾")).toEqual([]);
   });
 });

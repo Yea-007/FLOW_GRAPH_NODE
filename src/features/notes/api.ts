@@ -1,6 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
-import type { StyleRange } from "../markdown/styleRanges";
-import type { Note, NoteDropPosition, NoteIcon, NoteMetadata, NoteReorderEntry, SaveNoteRequest } from "./types";
+import type { EditorDocument } from "../markdown/documentModel";
+import type { Note, NoteDropPosition, NoteGroupTarget, NoteIcon, NoteMetadata, NoteReorderEntry, SaveNoteRequest } from "./types";
 
 export function listNotes(): Promise<NoteMetadata[]> {
   return invoke("notes_list");
@@ -17,6 +17,10 @@ export function createNote(request: SaveNoteRequest): Promise<Note> {
 
 export function updateNote(id: string, request: SaveNoteRequest): Promise<Note> {
   return invoke("notes_update", { id, request });
+}
+
+export function saveGroupedNote(id: string | null, request: SaveNoteRequest, group: NoteGroupTarget): Promise<Note> {
+  return invoke("notes_save_grouped", { id, request, group });
 }
 
 export function deleteNote(id: string): Promise<void> {
@@ -52,12 +56,10 @@ export function getErrorMessage(error: unknown): string {
 }
 
 /** The content snapshot lets callers detect a stale sidecar without dropping it. */
-export interface NoteStyleDocument { content: string; ranges: StyleRange[] }
-
-export function getNoteStyles(id: string): Promise<NoteStyleDocument | null> {
+export function getNoteStyles(id: string): Promise<EditorDocument | null> {
   return invoke("notes_get_styles", { id });
 }
 
-export function saveNoteStyles(id: string, document: NoteStyleDocument): Promise<void> {
+export function saveNoteStyles(id: string, document: EditorDocument): Promise<void> {
   return invoke("notes_save_styles", { id, document });
 }

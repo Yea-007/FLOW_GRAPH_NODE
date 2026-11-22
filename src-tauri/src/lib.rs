@@ -2,8 +2,8 @@ pub mod desktop;
 pub mod services;
 
 use services::notes::{
-    default_store, read_file_base64, AppConfig, AppError, Note, NoteDropPosition, NoteIcon,
-    NoteMetadata, NoteReorderEntry, SaveNoteRequest, StyleDocument,
+    default_store, read_file_base64, AppConfig, AppError, Note, NoteDropPosition, NoteGroupTarget,
+    NoteIcon, NoteMetadata, NoteReorderEntry, SaveNoteRequest, StyleDocument,
 };
 use std::path::PathBuf;
 use tauri::{AppHandle, Emitter};
@@ -33,6 +33,18 @@ fn notes_create(app: AppHandle, request: SaveNoteRequest) -> Result<Note, AppErr
 #[tauri::command]
 fn notes_update(app: AppHandle, id: String, request: SaveNoteRequest) -> Result<Note, AppError> {
     let note = default_store()?.update_note(&id, request)?;
+    let _ = app.emit("notes-changed", &note.id);
+    Ok(note)
+}
+
+#[tauri::command]
+fn notes_save_grouped(
+    app: AppHandle,
+    id: Option<String>,
+    request: SaveNoteRequest,
+    group: NoteGroupTarget,
+) -> Result<Note, AppError> {
+    let note = default_store()?.save_grouped_note(id.as_deref(), request, group)?;
     let _ = app.emit("notes-changed", &note.id);
     Ok(note)
 }
@@ -139,6 +151,7 @@ pub fn run() {
             notes_get,
             notes_create,
             notes_update,
+            notes_save_grouped,
             notes_set_icon,
             notes_get_styles,
             notes_save_styles,

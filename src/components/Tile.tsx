@@ -109,7 +109,7 @@ export function Tile({
           <div className="leading-[1.8] whitespace-pre-wrap font-body" style={{ color: contentColor, fontSize: `${fontSize}px` }}>
             {content}
           </div>
-        ) : (
+        ) : !title && (
           <div className="font-body text-center py-6" style={{ color: emptyColor, fontSize: `${fontSize}px` }}>
             空
           </div>

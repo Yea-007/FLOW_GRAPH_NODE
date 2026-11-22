@@ -223,3 +223,26 @@ textarea::placeholder, input::placeholder {
 [data-text-background][data-text-color="green"] { color: #086334; }
 [data-text-background][data-text-color="blue"] { color: #204da0; }
 [data-text-background][data-text-color="purple"] { color: #653298; }
+
+[data-bookmark-picking] {
+  cursor: crosshair;
+  user-select: none;
+}
+
+[data-bookmark-picking] :is(a, img, input, [data-preview-line]) {
+  cursor: inherit;
+}
+
+[data-bookmark-picking] [data-preview-line]:hover {
+  box-shadow: inset 0 -2px var(--color-bamboo-light);
+}
+
+[data-bookmarked]:not([data-bookmarked] [data-bookmarked]) {
+  background-color: var(--color-bamboo-mist);
+  box-shadow: inset 0 -2px var(--color-bamboo-light);
+  box-decoration-break: clone;
+}
+
+[data-bookmarked] > img {
+  outline: 2px solid var(--color-bamboo-light);
+}
