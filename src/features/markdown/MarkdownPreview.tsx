@@ -1,6 +1,7 @@
-import { useEffect, useLayoutEffect, useMemo, useState, useRef } from "react";
-import type { MouseEvent, RefObject } from "react";
+import { createContext, memo, useContext, useEffect, useLayoutEffect, useMemo, useState, useRef } from "react";
+import type { MouseEvent, RefObject, UIEventHandler } from "react";
 import { mappedPreviewPlugin, sourceSelection } from "./previewMapping";
+import type { PreviewEdit } from "./previewEditing";
 import type { StyleRange } from "./styleRanges";
 import Markdown from "react-markdown";
 import remarkGfm from "remark-gfm";
@@ -20,15 +21,40 @@ interface MarkdownPreviewProps {
   onUndo?: () => void;
   onRedo?: () => void;
   onStyle?: (start: number, end: number, property: "color" | "background" | "size", value: string | number | undefined) => void;
-  onEdit?: (start: number, end: number, text: string) => void;
+  onPreviewEdit?: (action: PreviewEdit) => void;
   bookmarks?: NoteBookmark[];
   onMarkBookmark?: (offset: number) => void;
   bookmarkJump?: { offset: number } | null;
   scrollRef?: RefObject<HTMLDivElement | null>;
+  onScroll?: UIEventHandler<HTMLDivElement>;
+  visible?: boolean;
 }
 
 const remarkPlugins = [remarkGfm, remarkMath];
 const emptyRanges: StyleRange[] = [];
+const PreviewEditContext = createContext<MarkdownPreviewProps["onPreviewEdit"]>(undefined);
+
+const TaskCheckbox: NonNullable<Components["input"]> = ({ checked, node }) => {
+  const onPreviewEdit = useContext(PreviewEditContext);
+  const itemStart = node?.properties.dataPreviewTaskStart;
+  const editable = onPreviewEdit && typeof itemStart === "number";
+
+  return (
+    <input
+      type="checkbox"
+      checked={Boolean(checked)}
+      aria-label="任务完成状态"
+      aria-disabled={!editable}
+      tabIndex={editable ? undefined : -1}
+      readOnly={!editable}
+      data-preview-line={node?.properties.dataPreviewLine as number | undefined}
+      onChange={editable ? (event) => onPreviewEdit({
+        type: "set-task-checked", itemStart, checked: event.currentTarget.checked,
+      }) : undefined}
+      className={`mr-1.5 accent-bamboo w-3.5 h-3.5 align-middle ${editable ? "cursor-pointer" : "cursor-default"}`}
+    />
+  );
+};
 
 function ImgRenderer({ src, alt, notesDir }: { src?: string; alt?: string; notesDir?: string }) {
   const targetPath = resolveImagePath(src ?? "", notesDir);
@@ -199,31 +225,25 @@ function buildComponents(notesDir?: string): Components {
         {children}
       </td>
     ),
-    input: ({ checked }) => (
-      <input
-        type="checkbox"
-        checked={Boolean(checked)}
-        readOnly
-        className="mr-1.5 accent-bamboo w-3.5 h-3.5 align-middle cursor-default"
-      />
-    ),
+    input: TaskCheckbox,
   };
 }
 
-export function MarkdownPreview({
-  content, fontSize = 14, notesDir, ranges = emptyRanges, onStyle, onEdit, onUndo, onRedo,
-  bookmarks, onMarkBookmark, bookmarkJump, scrollRef,
+export const MarkdownPreview = memo(function MarkdownPreview({
+  content, fontSize = 14, notesDir, ranges = emptyRanges, onStyle, onPreviewEdit, onUndo, onRedo,
+  bookmarks, onMarkBookmark, bookmarkJump, scrollRef, onScroll, visible = true,
 }: MarkdownPreviewProps) {
   const root = useRef<HTMLDivElement>(null);
+  const localScrollRef = useRef<HTMLDivElement>(null);
+  const scrollerRef = scrollRef ?? localScrollRef;
   const [selection, setSelection] = useState<{ start: number; end: number } | null>(null);
-  const [editing, setEditing] = useState<{ start: number; end: number; text: string } | null>(null);
-  useEffect(() => { setSelection(null); setEditing(null); }, [content]);
+  useEffect(() => { setSelection(null); }, [content]);
   const components = useMemo(() => buildComponents(notesDir), [notesDir]);
   const preview = useMemo(() => (
-    content.trim() ? (
+    !visible ? null : content.trim() ? (
       <Markdown remarkPlugins={remarkPlugins} rehypePlugins={[mappedPreviewPlugin(content, ranges), rehypeKatex]} components={components}>{content}</Markdown>
-    ) : <p className="text-ink-ghost leading-[1.9]">在源码区开始写作，预览中的文字可双击修改</p>
-  ), [components, content, ranges]);
+    ) : <p className="text-ink-ghost leading-[1.9]">在编辑区开始写作，即可看到预览</p>
+  ), [components, content, ranges, visible]);
 
   useLayoutEffect(() => {
     const marked = bookmarks?.flatMap(({ offset }) => Array.from(
@@ -236,14 +256,14 @@ export function MarkdownPreview({
   useLayoutEffect(() => {
     if (!bookmarkJump) return;
     const target = root.current?.querySelector(`[data-preview-line="${bookmarkJump.offset}"]`);
-    const scroller = scrollRef?.current;
+    const scroller = scrollerRef.current;
     if (!target || !scroller) return;
     const { top, height } = target.getBoundingClientRect();
     scroller.scrollTo({
       top: scroller.scrollTop + top - scroller.getBoundingClientRect().top - (scroller.clientHeight - height) / 2,
       behavior: window.matchMedia("(prefers-reduced-motion: reduce)").matches ? "auto" : "smooth",
     });
-  }, [bookmarkJump, scrollRef]);
+  }, [bookmarkJump, scrollerRef]);
 
   function pickBookmark(event: MouseEvent<HTMLDivElement>) {
     if (!onMarkBookmark) return;
@@ -259,8 +279,8 @@ export function MarkdownPreview({
     if (line?.dataset.previewLine !== undefined) onMarkBookmark(Number(line.dataset.previewLine));
   }
 
-  return <div className="flex flex-col min-h-0 h-full">
-    {onStyle && <div className="flex flex-wrap gap-1 py-2 sticky top-0 bg-cloud z-10 border-b border-paper-deep" role="toolbar" aria-label="预览文字格式">
+  return <div className="flex min-h-0 flex-1 flex-col">
+    {onStyle && <div className="mx-6 flex shrink-0 flex-wrap gap-1 border-b border-paper-deep py-2" role="toolbar" aria-label="预览文字格式">
       {(["color", "background", "size"] as const).map(property => <select key={property} aria-label={property === "color" ? "文字颜色" : property === "background" ? "背景颜色" : "文字大小"} className="format-select" disabled={!selection} value="" onChange={e => { if (selection) onStyle(selection.start, selection.end, property, e.target.value === "default" ? undefined : property === "size" ? Number(e.target.value) : e.target.value); }}>
         <option value="" disabled>{property === "color" ? "文字颜色" : property === "background" ? "背景颜色" : "字号"}</option><option value="default">恢复默认</option>
         {(property === "size" ? [["12","12"],["16","16"],["20","20"],["24","24"]] : property === "color" ? [["red","红色"],["orange","橙色"],["green","绿色"],["blue","蓝色"],["purple","紫色"]] : [["yellow","黄色"],["pink","粉色"],["green","绿色"],["blue","蓝色"],["purple","紫色"]]).map(([v,label]) => <option key={v} value={v}>{label}</option>)}
@@ -269,19 +289,24 @@ export function MarkdownPreview({
       <button type="button" title="重做 Ctrl+Y" className="format-select" onClick={onRedo}>重做</button>
       {onMarkBookmark ? (
         <span role="status" className="text-xs text-bamboo self-center">点击预览中的一行添加书签，按 Esc 取消</span>
-      ) : <span className="text-xs text-ink-faint self-center">选中文字设置格式 · 双击文字编辑</span>}
+      ) : <span className="text-xs text-ink-faint self-center">选中文字设置格式 · 点击任务框更新状态</span>}
     </div>}
-    {editing && <div className="my-2 p-2 border border-bamboo rounded bg-paper-warm">
-      <textarea aria-label="修改预览文字" autoFocus className="w-full text-ink min-h-20" value={editing.text} onChange={e => setEditing({ ...editing, text: e.target.value })} />
-      <button className="px-3 py-1 text-bamboo" onClick={() => { onEdit?.(editing.start, editing.end, editing.text); setEditing(null); requestAnimationFrame(() => root.current?.focus()); }}>应用修改</button>
-      <button className="px-3 py-1 text-ink-soft" onClick={() => setEditing(null)}>取消</button>
-    </div>}
-    <div ref={root} tabIndex={onEdit ? 0 : undefined} data-bookmark-picking={onMarkBookmark ? "true" : undefined} className="max-w-[560px] font-body" style={{ fontSize: `${fontSize}px` }} onClickCapture={pickBookmark} onMouseUp={() => { if (root.current && !onMarkBookmark) setSelection(sourceSelection(root.current)); }} onKeyUp={() => { if (root.current) setSelection(sourceSelection(root.current)); }} onDoubleClick={e => {
-      if (!onEdit) return;
-      const target = (e.target as HTMLElement).closest<HTMLElement>("[data-source-start]");
-      if (target) { const start = Number(target.dataset.sourceStart), end = Number(target.dataset.sourceEnd); setEditing({ start, end, text: content.slice(start,end) }); }
-    }}>
-      {preview}
+    <div ref={scrollerRef} onScroll={onScroll} role="region" aria-label="笔记预览" className="min-h-0 flex-1 overflow-y-auto px-6 pb-6 pt-2">
+      <div
+        ref={root}
+        tabIndex={onStyle ? 0 : undefined}
+        data-bookmark-picking={onMarkBookmark ? "true" : undefined}
+        className="max-w-[560px] font-body"
+        style={{ fontSize: `${fontSize}px` }}
+        onClickCapture={pickBookmark}
+        onMouseUp={() => { if (root.current && !onMarkBookmark) setSelection(sourceSelection(root.current)); }}
+        onKeyUp={() => { if (root.current) setSelection(sourceSelection(root.current)); }}
+      >
+        <PreviewEditContext.Provider value={onMarkBookmark ? undefined : onPreviewEdit}>
+          {preview}
+        </PreviewEditContext.Provider>
+      </div>
     </div>
   </div>;
-}
+// Keep the last rendered preview while hidden, and apply any pending edits when it becomes visible.
+}, (_previous, next) => next.visible === false);

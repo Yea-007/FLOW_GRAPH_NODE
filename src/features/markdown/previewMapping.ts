@@ -1,5 +1,6 @@
 import type { Root, Element, Text, RootContent } from "hast";
-import { sourceLines } from "../notes/bookmarks";
+import { sourceLineIndex, sourceLines } from "../notes/bookmarks";
+import { findTaskMarker } from "./previewEditing";
 import type { StyleRange } from "./styleRanges";
 
 function element(tagName: string, properties: Element["properties"], children: Element["children"]): Element {
@@ -81,6 +82,22 @@ export function mappedPreviewPlugin(content: string, ranges: StyleRange[]) {
       return node;
     }
 
+    function mapTask(node: Element) {
+      const classes = node.properties.className;
+      const itemStart = node.position?.start.offset;
+      if (itemStart === undefined || !Array.isArray(classes) || !classes.includes("task-list-item")) return;
+
+      // GFM puts the generated input directly in a tight item, or in its first paragraph.
+      const first = node.children.find((child) => child.type === "element");
+      const checkbox = first?.tagName === "p" ? first.children[0] : first;
+      if (checkbox?.type !== "element" || checkbox.tagName !== "input" || checkbox.properties.type !== "checkbox") return;
+      const marker = findTaskMarker(content, itemStart);
+      if (marker && marker.checked === checkbox.properties.checked) {
+        checkbox.properties.dataPreviewTaskStart = itemStart;
+        checkbox.properties.dataPreviewLine = lines[sourceLineIndex(lines, marker.start)].offset;
+      }
+    }
+
     function mapNode(node: RootContent): RootContent[] {
       if (node.type === "text") return mapText(node);
       if (node.type !== "element") return [node];
@@ -91,6 +108,7 @@ export function mappedPreviewPlugin(content: string, ranges: StyleRange[]) {
         if (node.tagName === "pre") return [mapCode(node, index, line.offset)];
         if (isMath(node)) return [element("span", { dataPreviewLine: line.offset }, [node])];
         if (["code", "img", "hr", "tr"].includes(node.tagName)) node.properties.dataPreviewLine = line.offset;
+        if (node.tagName === "li") mapTask(node);
       }
       node.children = node.children.flatMap(mapNode) as Element["children"];
       return [node];

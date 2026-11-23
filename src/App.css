@@ -133,14 +133,6 @@ textarea::placeholder, input::placeholder {
 .animate-note-enter {
   animation: note-enter 0.6s cubic-bezier(0.22, 1, 0.36, 1) forwards;
 }
-@keyframes view-fade {
-  from { opacity: 0; }
-  to { opacity: 1; }
-}
-.animate-view-fade {
-  animation: view-fade 0.72s ease-out forwards;
-}
-
 /* Delete confirm inline pop */
 @keyframes delete-confirm-enter {
   from { opacity: 0; transform: scale(0.9); }

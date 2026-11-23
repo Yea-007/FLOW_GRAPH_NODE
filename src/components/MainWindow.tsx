@@ -3,9 +3,11 @@ import type { MouseEvent } from "react";
 import { emit, listen } from "@tauri-apps/api/event";
 import { exportMarkdownNote, importMarkdownNote } from "../features/importExport/api";
 import { MarkdownPreview } from "../features/markdown/MarkdownPreview";
+import { resolvePreviewEdit, type PreviewEdit } from "../features/markdown/previewEditing";
 import { migrateLegacyStyles, type EditorDocument } from "../features/markdown/documentModel";
-import { findTextEdit, rebaseStyles, setRangeStyle, type StyleRange } from "../features/markdown/styleRanges";
+import { findTextEdit, rebaseStyles, setRangeStyle, type StyleRange, type TextEdit } from "../features/markdown/styleRanges";
 import { ContentHistory } from "../features/markdown/contentHistory";
+import { useNoteView } from "../features/markdown/useNoteView";
 import {
   chooseNotesDirectory,
   getConfig,
@@ -264,9 +266,6 @@ export function MainWindow({
   const [notes, setNotes] = useState<NoteMetadata[]>([]);
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [searchQuery, setSearchQuery] = useState("");
-  const [viewMode, setViewMode] = useState<ViewMode>(
-    normalizeViewMode(initialConfig?.defaultViewMode ?? "split"),
-  );
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const [content, setContent] = useState("");
   const [title, setTitle] = useState("");
@@ -289,8 +288,10 @@ export function MainWindow({
   const [deleteExiting, setDeleteExiting] = useState(false);
   const [sidebarWidth, setSidebarWidth] = useState(DEFAULT_SIDEBAR_WIDTH);
   const [splitRatio, setSplitRatio] = useState(0.5);
-  const contentRef = useRef<HTMLTextAreaElement>(null);
-  const previewScrollRef = useRef<HTMLDivElement>(null);
+  const lines = useMemo(() => sourceLines(content), [content]);
+  const { viewMode, setViewMode, viewRef, contentRef, previewScrollRef, trackScroll } = useNoteView(
+    normalizeViewMode(initialConfig?.defaultViewMode ?? "split"), selectedId, lines,
+  );
   const [ranges, setRanges] = useState<StyleRange[]>([]);
   const [bookmarks, setBookmarks] = useState<NoteBookmark[]>(emptyBookmarks);
   const [markingBookmark, setMarkingBookmark] = useState(false);
@@ -311,7 +312,7 @@ export function MainWindow({
     saveStateRef.current = "dirty";
     setContent(next.content); setRanges(next.ranges); setBookmarks(next.bookmarks ?? emptyBookmarks); setSaveState("dirty");
   }, []);
-  const changeContent = useCallback((next: string, typing = false, sourceEdit?: { start: number; end: number; text: string }) => {
+  const changeContent = useCallback((next: string, typing = false, sourceEdit?: TextEdit) => {
     const current = documentRef.current;
     const edit = sourceEdit ?? findTextEdit(current.content, next);
     commitDocument({
@@ -320,6 +321,14 @@ export function MainWindow({
       bookmarks: rebaseBookmarks(current.bookmarks, current.content, next, edit),
     }, typing);
   }, [commitDocument]);
+  const editFromPreview = useCallback((action: PreviewEdit) => {
+    const current = documentRef.current.content;
+    if (!selectedId || activeIdRef.current !== selectedId || current !== content) return;
+    const edit = resolvePreviewEdit(current, action);
+    if (edit) {
+      changeContent(current.slice(0, edit.start) + edit.text + current.slice(edit.end), false, edit);
+    }
+  }, [changeContent, content, selectedId]);
   const formatContent = useCallback((next: string) => changeContent(next), [changeContent]);
   const restoreHistory = useCallback((redo: boolean) => {
     const encoded = redo ? historyRef.current.redo() : historyRef.current.undo();
@@ -342,7 +351,7 @@ export function MainWindow({
     }
     document.addEventListener("keydown", handleUndo);
     return () => document.removeEventListener("keydown", handleUndo);
-  }, [restoreHistory]);
+  }, [contentRef, restoreHistory]);
 
   const selectedNote = useMemo(
     () => notes.find((note) => note.id === selectedId) ?? null,
@@ -365,7 +374,6 @@ export function MainWindow({
     [filteredNotes],
   );
 
-  const lines = useMemo(() => sourceLines(content), [content]);
   const byteSize = useMemo(
     () => (new TextEncoder().encode(content).length / 1024).toFixed(1),
     [content],
@@ -502,7 +510,7 @@ export function MainWindow({
     return () => {
       cancelled = true;
     };
-  }, [applyNote, clearCurrentNote]);
+  }, [applyNote, clearCurrentNote, setViewMode]);
 
   useEffect(() => {
     function closeNoteMenu() {
@@ -602,7 +610,7 @@ export function MainWindow({
 
   const jumpToBookmark = (offset: number) => {
     setMarkingBookmark(false);
-    if (viewMode === "edit") setViewMode("preview");
+    if (viewMode === "edit") setViewMode("preview", false);
     setBookmarkJump({ offset });
   };
 
@@ -682,7 +690,7 @@ export function MainWindow({
         }
       }, 300);
     },
-    [savedNotesDir, refreshNotes, loadNote, clearCurrentNote],
+    [savedNotesDir, refreshNotes, loadNote, clearCurrentNote, setViewMode],
   );
 
   const handleSettingsChange = useCallback(
@@ -1341,104 +1349,94 @@ export function MainWindow({
               </div>
             </div>
 
-            <div data-note-editor key={viewMode} className="flex-1 flex min-h-0 animate-view-fade">
+            <div ref={viewRef} data-note-editor key={selectedId} className="flex-1 flex min-h-0 overflow-hidden">
               {!selectedId && !isLoading ? (
                 <div className="flex-1 flex items-center justify-center text-[13px] text-ink-ghost">
                   选择或新建一篇笔记
                 </div>
               ) : (
                 <>
-                  {(viewMode === "edit" || viewMode === "split") && (
-                    <div
-                      className="flex flex-col min-h-0"
-                      style={{
-                        width: viewMode === "split" ? `${splitRatio * 100}%` : "100%",
-                      }}
-                    >
-                      <div className="flex items-center flex-wrap gap-1 px-4 pt-2 pb-2 shrink-0 border-b border-paper-deep/50" role="toolbar" aria-label="Markdown 格式">
-                        <select aria-label="段落样式" defaultValue="" onChange={(e) => { if (contentRef.current && e.target.value) applyHeading(contentRef.current, e.target.value, formatContent, markDirty); e.target.value = ""; }} className="format-select"><option value="" disabled>段落</option><option value="0">正文</option>{[1,2,3,4,5,6].map(n => <option key={n} value={n}>标题 {n}</option>)}</select>
-                        {toolbarButtons.map((button) => (
-                          <button
-                            key={button.label}
-                            title={button.title}
-                            onMouseDown={(e) => e.preventDefault()}
-                            onClick={() => {
-                              if (contentRef.current) {
-                                applyFormat(contentRef.current, button.action, formatContent, markDirty);
-                              }
-                            }}
-                            className={`w-7 h-7 flex items-center justify-center rounded text-[13px] text-ink-soft hover:text-ink hover:bg-paper-warm transition-all cursor-pointer ${button.style}`}
-                          >
-                            {button.label}
-                          </button>
-                        ))}
-                      </div>
-
-                      <div className="flex-1 overflow-y-auto px-5 pb-4">
-                        <textarea
-                          ref={contentRef}
-                          value={content}
-                          onChange={(event) => {
-                            changeContent(event.target.value, true);
-                            markDirty();
+                  <div
+                    hidden={viewMode === "preview"}
+                    className="flex flex-col min-h-0 min-w-0"
+                    style={{
+                      width: viewMode === "split" ? `${splitRatio * 100}%` : "100%",
+                    }}
+                  >
+                    <div className="flex items-center flex-wrap gap-1 px-4 pt-2 pb-2 shrink-0 border-b border-paper-deep/50" role="toolbar" aria-label="Markdown 格式">
+                      <select aria-label="段落样式" defaultValue="" onChange={(e) => { if (contentRef.current && e.target.value) applyHeading(contentRef.current, e.target.value, formatContent, markDirty); e.target.value = ""; }} className="format-select"><option value="" disabled>段落</option><option value="0">正文</option>{[1,2,3,4,5,6].map(n => <option key={n} value={n}>标题 {n}</option>)}</select>
+                      {toolbarButtons.map((button) => (
+                        <button
+                          key={button.label}
+                          title={button.title}
+                          onMouseDown={(e) => e.preventDefault()}
+                          onClick={() => {
+                            if (contentRef.current) {
+                              applyFormat(contentRef.current, button.action, formatContent, markDirty);
+                            }
                           }}
-                          className="w-full h-full leading-[1.9] text-ink-soft font-mono placeholder:text-ink-ghost/40"
-                          style={{ fontSize: `${settingsConfig?.fontSize ?? 14}px` }}
-                          placeholder="开始写作……"
-                          spellCheck={false}
-                          disabled={!selectedId}
-                        />
-                      </div>
+                          className={`w-7 h-7 flex items-center justify-center rounded text-[13px] text-ink-soft hover:text-ink hover:bg-paper-warm transition-all cursor-pointer ${button.style}`}
+                        >
+                          {button.label}
+                        </button>
+                      ))}
                     </div>
-                  )}
+
+                    <div className="flex-1 overflow-y-auto px-5 pb-4">
+                      <textarea
+                        ref={contentRef}
+                        value={content}
+                        onScroll={(event) => trackScroll("edit", event)}
+                        onChange={(event) => {
+                          changeContent(event.target.value, true);
+                          markDirty();
+                        }}
+                        className="w-full h-full leading-[1.9] text-ink-soft font-mono placeholder:text-ink-ghost/40"
+                        style={{ fontSize: `${settingsConfig?.fontSize ?? 14}px` }}
+                        placeholder="开始写作……"
+                        spellCheck={false}
+                        disabled={!selectedId}
+                      />
+                    </div>
+                  </div>
 
                   {viewMode === "split" && (
                     <ResizeHandle onDrag={handleSplitResize} />
                   )}
 
-                  {(viewMode === "preview" || viewMode === "split") && (
-                    <div
-                      className="flex flex-col min-h-0"
-                      style={{
-                        width: viewMode === "split"
-                          ? `${(1 - splitRatio) * 100}%`
-                          : "100%",
-                      }}
-                    >
-                      {viewMode === "split" && (
-                        <div className="px-4 pt-2.5 pb-1 shrink-0">
-                          <span className="text-[10px] text-ink-ghost/60 font-mono tracking-widest uppercase">
-                            Preview
-                          </span>
-                        </div>
-                      )}
-                      <div
-                        ref={previewScrollRef}
-                        className={`flex-1 overflow-y-auto px-6 pb-6 ${
-                          viewMode === "preview" ? "pt-3" : "pt-1"
-                        }`}
-                      >
-                        <MarkdownPreview
-                          key={selectedId}
-                          content={content}
-                          ranges={ranges}
-                          bookmarks={bookmarks}
-                          onMarkBookmark={markingBookmark ? markBookmark : undefined}
-                          bookmarkJump={bookmarkJump}
-                          scrollRef={previewScrollRef}
-                          onUndo={() => restoreHistory(false)}
-                          onRedo={() => restoreHistory(true)}
-                          onStyle={(start, end, property, value) => commitDocument({ ...documentRef.current, ranges: setRangeStyle(documentRef.current.ranges, start, end, property, value) })}
-                          onEdit={(start, end, text) => {
-                            const current = documentRef.current.content;
-                            changeContent(current.slice(0, start) + text + current.slice(end), false, { start, end, text });
-                          }}
-                          fontSize={settingsConfig?.fontSize ?? 14}
-                          notesDir={settingsConfig?.notesDir}
-                        />
+                  <div
+                    hidden={viewMode === "edit"}
+                    className={`flex flex-col min-h-0 min-w-0 ${viewMode === "preview" ? "pt-3" : ""}`}
+                    style={{
+                      width: viewMode === "split"
+                        ? `${(1 - splitRatio) * 100}%`
+                        : "100%",
+                    }}
+                  >
+                    {viewMode === "split" && (
+                      <div className="px-4 pt-2.5 pb-1 shrink-0">
+                        <span className="text-[10px] text-ink-ghost/60 font-mono tracking-widest uppercase">
+                          Preview
+                        </span>
                       </div>
-                    </div>
-                  )}
+                    )}
+                    <MarkdownPreview
+                      visible={viewMode !== "edit"}
+                      scrollRef={previewScrollRef}
+                      onScroll={(event) => trackScroll("preview", event)}
+                      content={content}
+                      ranges={ranges}
+                      bookmarks={bookmarks}
+                      onMarkBookmark={markingBookmark ? markBookmark : undefined}
+                      bookmarkJump={bookmarkJump}
+                      onUndo={() => restoreHistory(false)}
+                      onRedo={() => restoreHistory(true)}
+                      onStyle={(start, end, property, value) => commitDocument({ ...documentRef.current, ranges: setRangeStyle(documentRef.current.ranges, start, end, property, value) })}
+                      onPreviewEdit={editFromPreview}
+                      fontSize={settingsConfig?.fontSize ?? 14}
+                      notesDir={settingsConfig?.notesDir}
+                    />
+                  </div>
                 </>
               )}
             </div>

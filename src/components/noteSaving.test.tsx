@@ -409,6 +409,42 @@ describe("main-window synchronization", () => {
   });
 });
 
+describe("main-window view switching", () => {
+  test("keeps both panes mounted and restores the last scrolled preview line", async () => {
+    const origin = note("long-note", "开头\n\n中间\n\n结尾");
+    vi.mocked(listNotes).mockResolvedValue([metadataFromNote(origin)]);
+    vi.mocked(getNote).mockResolvedValue(origin);
+    vi.mocked(getConfig).mockResolvedValue({ ...config, defaultViewMode: "split" });
+    await mount(<MainWindow />);
+
+    const editor = container.querySelector("textarea")!;
+    const preview = container.querySelector<HTMLDivElement>('[aria-label="笔记预览"]')!;
+    const [first, middle] = preview.querySelectorAll<HTMLElement>("[data-preview-line]");
+    const rect = (top: number, height: number) => ({ top, bottom: top + height, height }) as DOMRect;
+    vi.spyOn(preview, "getBoundingClientRect").mockReturnValue(rect(100, 150));
+    vi.spyOn(first, "getBoundingClientRect").mockReturnValue(rect(10, 20));
+    vi.spyOn(middle, "getBoundingClientRect").mockImplementation(() =>
+      rect((editor.closest("[hidden]") ? 160 : 195) - preview.scrollTop, 20),
+    );
+    editor.setSelectionRange(3, 5);
+    preview.scrollTop = 100;
+    await act(async () => { preview.dispatchEvent(new Event("scroll")); });
+
+    await click("预览");
+    expect(editor.closest("[hidden]")).not.toBeNull();
+    expect(preview.closest("[hidden]")).toBeNull();
+    expect(preview.scrollTop).toBe(65);
+    expect(container.querySelector("[data-preview-line]")).toBe(first);
+
+    await click("分栏");
+    expect(editor.closest("[hidden]")).toBeNull();
+    expect(preview.scrollTop).toBe(100);
+    expect(container.querySelector("textarea")).toBe(editor);
+    expect([editor.selectionStart, editor.selectionEnd]).toEqual([3, 5]);
+    expect(getNote).toHaveBeenCalledOnce();
+  });
+});
+
 describe("main-window bookmarks", () => {
   test("marks the chosen preview line, saves its manual name, and jumps without reloading the note", async () => {
     const content = "第一行😀\r\n第二行 **粗体**\r\n第三行";
@@ -453,5 +489,67 @@ describe("main-window bookmarks", () => {
     await click("书签");
     expect(container.querySelector('[aria-label="当前笔记书签"]')?.textContent).toContain("复习重点");
     expect(container.querySelector('[data-preview-line="7"]')?.hasAttribute("data-bookmarked")).toBe(true);
+  });
+});
+
+describe("main-window task editing from preview", () => {
+  test("updates only the chosen task and uses the normal history and auto-save", async () => {
+    const prefix = "\uFEFF> 1. [ ] 重复任务😀\r\n>    - [x] 嵌套任务\r\n\r\n";
+    const suffix = "\r\n\r\n```md\r\n- [ ] 重复任务\r\n```";
+    const content = prefix + "- [ ] 重复任务" + suffix;
+    const changed = prefix + "- [X] 重复任务" + suffix;
+    const origin = note("tasks", content, "任务清单");
+    const bookmarks = [{ id: "task", name: "末尾任务", offset: prefix.length }];
+    const ranges = [{ start: prefix.length + 6, end: prefix.length + 10, color: "red" }];
+    origin.styleDocument = { content, ranges, bookmarks };
+    vi.mocked(listNotes).mockResolvedValue([metadataFromNote(origin)]);
+    vi.mocked(getNote).mockResolvedValue(origin);
+    vi.mocked(getConfig).mockResolvedValue({ ...config, defaultViewMode: "split", noteAutoSave: true });
+    await mount(<MainWindow />);
+
+    const checks = () => [...container.querySelectorAll<HTMLInputElement>('[aria-label="任务完成状态"]')];
+    const source = container.querySelector("textarea")!;
+    const normalized = (value: string) => value.replace(/\r\n/g, "\n");
+    const preview = container.querySelector('[aria-label="笔记预览"]')!;
+    const toolbar = container.querySelector('[aria-label="预览文字格式"]')!;
+    expect(toolbar.nextElementSibling).toBe(preview);
+    expect(checks().map((check) => check.checked)).toEqual([false, true, false]);
+    await act(async () => { checks()[2].click(); });
+    expect(normalized(source.value)).toBe(normalized(changed));
+    expect(checks().map((check) => check.checked)).toEqual([false, true, true]);
+    await act(async () => { checks()[1].click(); });
+    expect(source.value).toContain("- [ ] 嵌套任务");
+    await click("撤销 Ctrl+Z");
+    expect(normalized(source.value)).toBe(normalized(changed));
+    await click("撤销 Ctrl+Z");
+    expect(normalized(source.value)).toBe(normalized(content));
+    await click("重做 Ctrl+Y");
+    expect(normalized(source.value)).toBe(normalized(changed));
+
+    await advance(900);
+    expect(updateNote).toHaveBeenCalledExactlyOnceWith(origin.id, { title: origin.title, content: changed });
+    expect(saveNoteStyles).toHaveBeenCalledExactlyOnceWith(origin.id, { content: changed, ranges, bookmarks });
+  });
+
+  test("lets preview mode change tasks, while plain text stays read-only", async () => {
+    const origin = note("preview-only", "一段普通文字\n\n- [ ] 待办", "任务");
+    vi.mocked(listNotes).mockResolvedValue([metadataFromNote(origin)]);
+    vi.mocked(getNote).mockResolvedValue(origin);
+    vi.mocked(getConfig).mockResolvedValue({ ...config, defaultViewMode: "preview" });
+    await mount(<MainWindow />);
+
+    const plain = container.querySelector<HTMLElement>('[data-preview-line="0"]')!;
+    await act(async () => { plain.dispatchEvent(new MouseEvent("dblclick", { bubbles: true })); });
+    expect(container.querySelector("textarea")?.closest("[hidden]")).not.toBeNull();
+
+    const task = container.querySelector<HTMLInputElement>('[aria-label="任务完成状态"]')!;
+    await click("标记书签");
+    await act(async () => { task.click(); });
+    expect(task.checked).toBe(false);
+    expect(task.hasAttribute("data-bookmarked")).toBe(true);
+    await act(async () => { task.click(); });
+    expect(task.checked).toBe(true);
+    await click("保存");
+    expect(updateNote).toHaveBeenCalledExactlyOnceWith(origin.id, { title: origin.title, content: "一段普通文字\n\n- [X] 待办" });
   });
 });
