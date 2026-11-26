@@ -1,12 +1,4 @@
-# FLOW_GRAPH_NODE · 花笺
-
-花笺是一款 Windows 桌面便签工具。用笔记树整理 Markdown，在分栏视图里边写边看，或按 `Ctrl+Space` 打开小窗随手记录。笔记保存在本机，可导出为 `.md` 文件。
-
-**[下载 Windows x64 安装包](https://github.com/Yea-007/FLOW_GRAPH_NODE/releases/latest)**
-
-在发布页的 **Assets** 中下载并运行以 `-setup.exe` 结尾的文件。
-
-![花笺主窗口，笔记树、Markdown 编辑器和预览并排显示](Docs/images/主窗口截图.png)
+## FLOW_GRAPH_NODE 基于 Achilng 的花笺项目二次开发。源码按 MIT 许可证分发。[上游项目](https://github.com/Achilng/floral-notepaper) 
 
 ## 写下第一篇笔记
 
